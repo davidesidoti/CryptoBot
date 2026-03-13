@@ -24,7 +24,8 @@ Copy `.env.example` to `.env` and fill in Binance Testnet credentials:
 BINANCE_TESTNET_API_KEY=...
 BINANCE_TESTNET_SECRET=...
 ```
-Keys are obtained from https://testnet.binance.vision/ (GitHub login required).
+Keys are obtained from https://demo.binance.com (account Binance reale richiesto).
+The old `testnet.binance.vision` is deprecated — ccxt uses `exchange.enable_demo_trading(True)`.
 
 ## Architecture
 
@@ -34,7 +35,7 @@ Single-file bot (`cryptobot.py`). The pipeline runs sequentially:
 fetch_ohlcv()            → downloads 5000 OHLCV candles (paginated) from Binance public API
 build_features()         → adds 20 features (1h + 4h + 1d multi-timeframe) + dynamic ATR target
 walk_forward_train()     → binary XGBClassifier (BUY vs NO-BUY), 17 sliding folds
-backtest()               → backtesting.py, $100k cash, 0.1% commission, P&L in $
+backtest()               → backtesting.py, INITIAL_CASH (default $500), 0.1% commission, P&L in $
 run_bot()                → live loop on Binance Testnet every SLEEP_SECONDS
 ```
 
@@ -45,9 +46,20 @@ The model is binary: BUY (1) vs NO-BUY (0). `predict_proba` for BUY must exceed 
 - `shuffle=False` in train/test split is mandatory — time-series data, order matters.
 - `backtesting.py` requires capitalized column names (`Open`, `High`, `Low`, `Close`, `Volume`).
 - Live data fetches from **Binance public API** (real prices); orders go to **Binance Testnet** (fake funds).
-- The model is retrained from scratch on every run — no model persistence.
+- Model is persisted to `model.joblib`; delete it to force a full retrain: `rm model.joblib`
 - Bot is **LONG-ONLY** on Binance Spot — no shorting.
 - Invoke `trading-safety-reviewer` agent before modifying `run_bot()`.
+
+## Gotchas
+
+- **backtesting.py integer sizing**: with small capital vs high asset price (e.g. $500 vs BTC at $80K),
+  position sizes round to 0 and no trades execute. `backtest()` auto-scales prices via `price_divisor`;
+  P&L and % returns remain correct. Do not remove this logic.
+- **`stats["Commissions [$]"]` missing**: absent from backtesting.py stats when `# Trades == 0`.
+  Always gate with `if n_trades > 0` before accessing trade-level keys.
+- **Telegram HTML mode**: use `&amp;` not `&` (e.g. `P&amp;L`) — bare `&` causes silent drop.
+- **Binance Demo Trading keys**: keys from `demo.binance.com` and keys from `testnet.binance.vision`
+  are not interchangeable — they are separate systems.
 
 ## Features used by the model (20 total)
 
