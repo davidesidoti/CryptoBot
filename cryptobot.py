@@ -669,9 +669,8 @@ def retrain_model():
     model = train_model(df_feat)
     save_model(model)
     send_telegram(
-        "<b>RETRAINING completato</b>\n"
-        f"Righe: {len(df_feat)} | "
-        f"Modello salvato"
+        f"🔄 <b>Retraining completato</b>\n"
+        f"📊 Righe: {len(df_feat)} | Modello aggiornato"
     )
     return model
 
@@ -701,10 +700,13 @@ def run_bot(model):
               f"({entry_qty} BTC)")
 
     last_retrain = time.time()
+    last_status  = time.time()
+    STATUS_INTERVAL = 1800  # notifica stato ogni 30 minuti
     send_telegram(
-        "<b>Bot avviato</b>\n"
-        f"Symbol: {SYMBOL} | TF: {TIMEFRAME}\n"
-        f"Retraining ogni {RETRAIN_HOURS}h"
+        f"🤖 <b>Bot avviato</b>\n"
+        f"📈 {SYMBOL} | {TIMEFRAME}\n"
+        f"🔄 Retraining ogni {RETRAIN_HOURS}h\n"
+        f"🛡 Stop loss: {STOP_LOSS:.0%} | Min confidenza: {MIN_PROBA:.0%}"
     )
 
     while True:
@@ -718,7 +720,7 @@ def run_bot(model):
                 except Exception as e:
                     print(f"[RETRAIN FALLITO] {e}")
                     send_telegram(
-                        f"<b>RETRAIN FALLITO</b>\n"
+                        f"⚠️ <b>Retraining fallito</b>\n"
                         f"<code>{str(e)[:500]}</code>"
                     )
                 last_retrain = time.time()  # reset timer anche se fallito
@@ -746,6 +748,36 @@ def run_bot(model):
                 f"USDT: {usdt:.2f} | BTC: {btc:.6f}"
             )
 
+            # --- Notifica stato periodica (ogni 30 min, solo lettura) ---
+            if (time.time() - last_status) >= STATUS_INTERVAL:
+                try:
+                    now_str = pd.Timestamp.now().strftime("%H:%M")
+                    if entry_price and btc > 0.0001:
+                        pnl_pct = (price - entry_price) / entry_price
+                        pnl_usd = (price - entry_price) * (entry_qty or 0)
+                        pnl_icon = "📈" if pnl_usd >= 0 else "📉"
+                        send_telegram(
+                            f"📊 <b>Status {now_str}</b>\n"
+                            f"━━━━━━━━━━━━━━━\n"
+                            f"🟢 In posizione\n"
+                            f"📌 Entry: ${entry_price:,.2f}\n"
+                            f"💰 Prezzo: ${price:,.2f}\n"
+                            f"{pnl_icon} P&amp;L: {pnl_pct:+.2%} (${pnl_usd:+,.2f})\n"
+                            f"🎯 Signal: {signal_str} ({buy_proba:.0%})"
+                        )
+                    else:
+                        send_telegram(
+                            f"📊 <b>Status {now_str}</b>\n"
+                            f"━━━━━━━━━━━━━━━\n"
+                            f"⚪ Nessuna posizione\n"
+                            f"💵 USDT: ${usdt:,.2f}\n"
+                            f"💰 BTC: ${price:,.2f}\n"
+                            f"🎯 Signal: {signal_str} ({buy_proba:.0%})"
+                        )
+                except Exception as e:
+                    print(f"[STATUS] Errore notifica: {e}")
+                last_status = time.time()
+
             # Stop loss check (solo per posizioni long)
             if entry_price and btc > 0.0001:
                 loss = (price - entry_price) / entry_price
@@ -758,9 +790,12 @@ def run_bot(model):
                     log_trade("SELL(SL)", qty, price, "STOP_LOSS",
                               buy_proba, pnl_usd)
                     send_telegram(
-                        f"<b>STOP LOSS</b>\n"
-                        f"SELL {qty} BTC @ ${price:,.2f}\n"
-                        f"Loss: {loss:.2%} | P&L: ${pnl_usd:+,.2f}"
+                        f"🛑 <b>Stop Loss</b>\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"🔴 SELL {qty} BTC\n"
+                        f"💰 Prezzo: ${price:,.2f}\n"
+                        f"📉 Loss: {loss:.2%}\n"
+                        f"💸 P&amp;L: ${pnl_usd:+,.2f}"
                     )
                     entry_price = None
                     entry_qty = None
@@ -782,9 +817,11 @@ def run_bot(model):
                           f"(BUY prob: {buy_proba:.0%})")
                     log_trade("BUY", qty, price, "BUY", buy_proba)
                     send_telegram(
-                        f"<b>BUY</b>\n"
-                        f"BUY {qty} BTC @ ${price:,.2f}\n"
-                        f"Confidenza: {buy_proba:.0%}"
+                        f"🟢 <b>BUY eseguito</b>\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"🛒 {qty} BTC @ ${price:,.2f}\n"
+                        f"🤖 Confidenza ML: {buy_proba:.0%}\n"
+                        f"💵 Investito: ${qty * price:,.2f}"
                     )
                     entry_price = price
                     entry_qty = qty
@@ -794,15 +831,17 @@ def run_bot(model):
                 # SELL tecnico: chiudi long
                 qty = round(btc * TRADE_SIZE, 6)
                 pnl_usd = (price - entry_price) * qty
+                pnl_pct = (price - entry_price) / entry_price
                 exchange.create_order(SYMBOL, "market", "sell", qty)
                 print(f"  -> ORDER: SELL(tech) {qty} BTC @ {price:.2f} "
                       f"(P&L: ${pnl_usd:+,.2f})")
                 log_trade("SELL", qty, price, "SELL_TECH", buy_proba, pnl_usd)
-                pnl_emoji = "+" if pnl_usd >= 0 else ""
+                pnl_icon = "📈" if pnl_usd >= 0 else "📉"
                 send_telegram(
-                    f"<b>SELL (tecnico)</b>\n"
-                    f"SELL {qty} BTC @ ${price:,.2f}\n"
-                    f"P&L: ${pnl_usd:+,.2f}"
+                    f"🔴 <b>SELL eseguito</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"💼 {qty} BTC @ ${price:,.2f}\n"
+                    f"{pnl_icon} P&amp;L: {pnl_pct:+.2%} (${pnl_usd:+,.2f})"
                 )
                 entry_price = None
                 entry_qty = None
@@ -814,7 +853,10 @@ def run_bot(model):
         except Exception as e:
             err_msg = f"{type(e).__name__}: {e}"
             print(f"[ERRORE] {err_msg}")
-            send_telegram(f"<b>ERRORE</b>\n<code>{err_msg[:500]}</code>")
+            send_telegram(
+                f"🚨 <b>Errore</b>\n"
+                f"<code>{err_msg[:500]}</code>"
+            )
 
         print(f"  -> Prossimo ciclo tra {SLEEP_SECONDS // 60} minuti...\n")
         time.sleep(SLEEP_SECONDS)
