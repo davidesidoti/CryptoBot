@@ -212,3 +212,7 @@ __marimo__/
 !.claude/hooks/telegram-pr-webhook.py
 .claude/commands/opsx/
 .claude/skills/
+MLStrategy.html
+trades_log.csv
+model.joblib
+bot_state.json
