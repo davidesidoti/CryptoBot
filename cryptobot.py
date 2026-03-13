@@ -555,23 +555,18 @@ def backtest(df_raw, df_feat, model, pred_series=None, test_size=0.2):
 
 def get_testnet_exchange():
     """
-    Ritorna un'istanza ccxt connessa al Binance Testnet.
+    Ritorna un'istanza ccxt connessa al Binance Demo Trading (ex Testnet).
+    Usa enable_demo_trading() che punta a demo-api.binance.com
+    (il vecchio testnet.binance.vision non e' piu' attivo).
     """
     exchange = ccxt.binance({
         "apiKey": TESTNET_API_KEY,
         "secret": TESTNET_SECRET,
         "options": {
             "defaultType": "spot",
-            "hostname": "testnet.binance.vision",
-            "fetchCurrencies": False,
         },
-        "urls": {
-            "api": {
-                "public":  "https://testnet.binance.vision/api",
-                "private": "https://testnet.binance.vision/api",
-            }
-        }
     })
+    exchange.enable_demo_trading(True)
     return exchange
 
 
