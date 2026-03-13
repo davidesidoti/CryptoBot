@@ -39,14 +39,15 @@ TIMEFRAME       = "1h"        # candele orarie
 FETCH_LIMIT     = 500         # quante candele storiche scaricare
 N_TRAIN         = 400         # candele usate per il training
 FUTURE_BARS     = 3           # quante candele in avanti per calcolare il label
-SIGNAL_THRESH   = 0.005       # 0.5% di movimento minimo per generare segnale
+SIGNAL_THRESH   = 0.01        # 1% di movimento minimo per generare segnale
 MIN_PROBA       = 0.50        # confidenza minima per eseguire un ordine
 TRADE_SIZE      = 0.95        # % del capitale usata per ogni trade
 SLEEP_SECONDS   = 3600        # secondo tra ogni ciclo del bot (1h)
 
 FEATURES = [
     "rsi", "macd", "macd_signal", "bb_width",
-    "vol_change", "price_change", "ema_cross"
+    "vol_change", "price_change", "ema_cross",
+    "atr", "obv_change", "stoch_k", "rsi_slope", "hour"
 ]
 
 # ─────────────────────────────────────────────
@@ -86,14 +87,21 @@ def build_features(df):
     df["macd"]        = macd_df["MACD_12_26_9"]
     df["macd_signal"] = macd_df["MACDs_12_26_9"]
     bb                = ta.bbands(df["close"], length=20)
-    df["bb_upper"]    = bb["BBU_20_2.0"]
-    df["bb_lower"]    = bb["BBL_20_2.0"]
+    df["bb_upper"]    = bb["BBU_20_2.0_2.0"]
+    df["bb_lower"]    = bb["BBL_20_2.0_2.0"]
     df["bb_width"]    = (df["bb_upper"] - df["bb_lower"]) / df["close"]
     df["vol_change"]  = df["volume"].pct_change()
     df["price_change"]= df["close"].pct_change()
     df["ema_9"]       = ta.ema(df["close"], length=9)
     df["ema_21"]      = ta.ema(df["close"], length=21)
     df["ema_cross"]   = df["ema_9"] - df["ema_21"]
+    df["atr"]         = ta.atr(df["high"], df["low"], df["close"], length=14)
+    obv               = ta.obv(df["close"], df["volume"])
+    df["obv_change"]  = obv.pct_change()
+    stoch              = ta.stoch(df["high"], df["low"], df["close"])
+    df["stoch_k"]     = stoch.iloc[:, 0]
+    df["rsi_slope"]   = df["rsi"].diff(5)
+    df["hour"]        = df.index.hour
 
     future_return     = df["close"].shift(-FUTURE_BARS) / df["close"] - 1
     df["label"]       = 0
@@ -120,9 +128,13 @@ def train_model(df):
     )
 
     model = XGBClassifier(
-        n_estimators=200,
-        max_depth=4,
+        n_estimators=300,
+        max_depth=3,
         learning_rate=0.05,
+        min_child_weight=5,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=0.1,
         eval_metric="mlogloss",
         verbosity=0
     )
@@ -139,16 +151,19 @@ def train_model(df):
 # 4. BACKTEST
 # ─────────────────────────────────────────────
 
-def backtest(df_raw, df_feat, model):
+def backtest(df_raw, df_feat, model, test_size=0.2):
     """
-    Backtesta la strategia ML su dati storici con backtesting.py.
+    Backtesta la strategia ML solo sui dati out-of-sample (test set)
+    per evitare data leakage.
     """
 
-    # Pre-calcola le predizioni sull'intero dataset e allineale all'indice raw
-    feat_index  = df_feat.index
+    # Usa solo la porzione test (out-of-sample) per il backtest
+    split_idx   = int(len(df_feat) * (1 - test_size))
+    df_test     = df_feat.iloc[split_idx:]
+    feat_index  = df_test.index
     raw_aligned = df_raw.loc[feat_index].copy()
 
-    predictions = model.predict(df_feat[FEATURES]) - 1   # ritorna a -1, 0, 1
+    predictions = model.predict(df_test[FEATURES]) - 1   # ritorna a -1, 0, 1
     pred_series = pd.Series(predictions, index=feat_index)
 
     class MLStrategy(Strategy):
@@ -181,7 +196,7 @@ def backtest(df_raw, df_feat, model):
     bt = Backtest(
         bt_df,
         MLStrategy,
-        cash=10_000,
+        cash=100_000,
         commission=0.001,      # 0.1% commission, uguale a Binance
         exclusive_orders=True
     )
