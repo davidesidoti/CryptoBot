@@ -562,7 +562,8 @@ def get_testnet_exchange():
         "secret": TESTNET_SECRET,
         "options": {
             "defaultType": "spot",
-            "hostname": "testnet.binance.vision"
+            "hostname": "testnet.binance.vision",
+            "fetchCurrencies": False,
         },
         "urls": {
             "api": {
@@ -862,4 +863,4 @@ if __name__ == "__main__":
         backtest(df_raw, df_feat, model, pred_series=wf_predictions)
 
     # Decommenta la riga sotto per avviare il bot live sul testnet
-    # run_bot(model)
+    run_bot(model)
