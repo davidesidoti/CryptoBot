@@ -9,6 +9,7 @@ import os
 import csv
 import json
 import time
+from datetime import datetime, timezone
 import warnings
 import urllib.request
 import ccxt
@@ -640,7 +641,7 @@ def save_dashboard_data(price, buy_proba, signal_str, usdt, btc,
                         entry_price, entry_qty, features_row):
     """Salva snapshot del ciclo corrente per la dashboard web."""
     data = {
-        "timestamp": pd.Timestamp.utcnow().isoformat() + "Z",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "price": price,
         "buy_proba": round(buy_proba, 4),
         "signal": signal_str,
