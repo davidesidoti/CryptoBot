@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CryptoBot Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        dark: { 800: '#1a1a2e', 700: '#16213e', 600: '#0f3460', 500: '#1a1a3e' },
+                        accent: { green: '#00e396', red: '#ff4560', blue: '#008ffb', yellow: '#feb019' }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { background: #0d1117; color: #e6edf3; font-family: 'Segoe UI', system-ui, sans-serif; }
+        .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; }
+        .glow-green { box-shadow: 0 0 12px rgba(0, 227, 150, 0.15); }
+        .glow-red { box-shadow: 0 0 12px rgba(255, 69, 96, 0.15); }
+        .pulse { animation: pulse 2s ease-in-out infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #161b22; }
+        ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+    </style>
+</head>
+<body class="min-h-screen p-4 md:p-6">
+
+    <!-- Header -->
+    <div class="flex items-center justify-between mb-6">
+        <div class="flex items-center gap-3">
+            <div class="text-2xl font-bold">
+                <span class="text-white">Crypto</span><span class="text-[#008ffb]">Bot</span>
+            </div>
+            <span class="text-xs px-2 py-1 rounded-full bg-[#008ffb]/20 text-[#008ffb]">BTC/USDT</span>
+        </div>
+        <div class="flex items-center gap-3 text-sm text-gray-400">
+            <div id="bot-status" class="flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-gray-500"></span>
+                <span>Caricamento...</span>
+            </div>
+            <div id="last-update" class="text-xs"></div>
+        </div>
+    </div>
+
+    <!-- Metric Cards -->
+    <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3 mb-6">
+        <div class="card p-4">
+            <div class="text-xs text-gray-400 mb-1">Prezzo BTC</div>
+            <div id="price" class="text-xl font-bold text-white">—</div>
+        </div>
+        <div class="card p-4">
+            <div class="text-xs text-gray-400 mb-1">Segnale</div>
+            <div id="signal" class="text-xl font-bold">—</div>
+        </div>
+        <div class="card p-4">
+            <div class="text-xs text-gray-400 mb-1">Confidenza ML</div>
+            <div id="confidence" class="text-xl font-bold text-[#008ffb]">—</div>
+            <div class="w-full bg-gray-700 rounded-full h-1.5 mt-2">
+                <div id="confidence-bar" class="h-1.5 rounded-full bg-[#008ffb] transition-all duration-500" style="width: 0%"></div>
+            </div>
+        </div>
+        <div class="card p-4">
+            <div class="text-xs text-gray-400 mb-1">Saldo USDT</div>
+            <div id="usdt" class="text-xl font-bold text-white">—</div>
+        </div>
+        <div class="card p-4">
+            <div class="text-xs text-gray-400 mb-1">Saldo BTC</div>
+            <div id="btc" class="text-xl font-bold text-white">—</div>
+        </div>
+        <div id="pnl-card" class="card p-4" style="display:none">
+            <div class="text-xs text-gray-400 mb-1">P&L Posizione</div>
+            <div id="pnl" class="text-xl font-bold">—</div>
+            <div id="pnl-usd" class="text-xs text-gray-400">—</div>
+        </div>
+    </div>
+
+    <!-- Position Banner -->
+    <div id="position-banner" class="card p-4 mb-6" style="display:none">
+        <div class="flex items-center justify-between flex-wrap gap-3">
+            <div class="flex items-center gap-3">
+                <span class="text-lg">📌</span>
+                <div>
+                    <div class="text-sm text-gray-400">Posizione aperta</div>
+                    <div class="text-white font-medium">
+                        Entry: $<span id="entry-price">—</span>
+                        &nbsp;|&nbsp;
+                        Qty: <span id="entry-qty">—</span> BTC
+                    </div>
+                </div>
+            </div>
+            <div id="position-pnl" class="text-right">
+                <div id="pos-pnl-pct" class="text-lg font-bold">—</div>
+                <div id="pos-pnl-usd" class="text-sm text-gray-400">—</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Charts -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+        <div class="card p-4">
+            <div class="text-sm font-medium text-gray-300 mb-3">Equity Curve</div>
+            <canvas id="equity-chart" height="200"></canvas>
+        </div>
+        <div class="card p-4">
+            <div class="text-sm font-medium text-gray-300 mb-3">Features Radar</div>
+            <canvas id="features-chart" height="200"></canvas>
+        </div>
+    </div>
+
+    <!-- Trades Table -->
+    <div class="card p-4">
+        <div class="text-sm font-medium text-gray-300 mb-3">Trade Recenti</div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead>
+                    <tr class="text-gray-400 text-xs border-b border-gray-700">
+                        <th class="pb-2 text-left">Data</th>
+                        <th class="pb-2 text-left">Side</th>
+                        <th class="pb-2 text-right">Qty</th>
+                        <th class="pb-2 text-right">Prezzo</th>
+                        <th class="pb-2 text-right">Confidenza</th>
+                        <th class="pb-2 text-right">P&L</th>
+                    </tr>
+                </thead>
+                <tbody id="trades-body" class="text-gray-300">
+                    <tr><td colspan="6" class="py-4 text-center text-gray-500">Caricamento...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <div class="text-center text-xs text-gray-600 mt-6">
+        Auto-refresh ogni 30s &nbsp;|&nbsp; CryptoBot Dashboard
+    </div>
+
+<script>
+    let equityChart = null;
+    let featuresChart = null;
+
+    // --- Formattazione ---
+    const fmt = (n, d=2) => n != null ? Number(n).toLocaleString('en-US', {minimumFractionDigits: d, maximumFractionDigits: d}) : '—';
+    const fmtPct = (n) => n != null ? (n >= 0 ? '+' : '') + (n * 100).toFixed(2) + '%' : '—';
+
+    // --- Aggiorna Status ---
+    async function updateStatus() {
+        try {
+            const res = await fetch('/api/status');
+            if (!res.ok) {
+                document.getElementById('bot-status').innerHTML =
+                    '<span class="w-2 h-2 rounded-full bg-gray-500"></span><span>Bot offline</span>';
+                return;
+            }
+            const d = await res.json();
+
+            // Timestamp
+            const ts = new Date(d.timestamp);
+            const age = Math.floor((Date.now() - ts.getTime()) / 1000);
+            const ageStr = age < 120 ? `${age}s fa` : `${Math.floor(age/60)}m fa`;
+            const nextCycle = Math.max(0, d.sleep_seconds - age);
+            const nextStr = nextCycle > 0 ? `${Math.floor(nextCycle/60)}m ${nextCycle%60}s` : 'imminente';
+
+            document.getElementById('bot-status').innerHTML =
+                `<span class="w-2 h-2 rounded-full ${age < d.sleep_seconds * 2 ? 'bg-[#00e396] pulse' : 'bg-[#feb019]'}"></span>` +
+                `<span>${age < d.sleep_seconds * 2 ? 'Online' : 'Stale'}</span>`;
+            document.getElementById('last-update').textContent = `Aggiornato ${ageStr} | Prossimo ciclo: ${nextStr}`;
+
+            // Cards
+            document.getElementById('price').textContent = '$' + fmt(d.price);
+            document.getElementById('usdt').textContent = '$' + fmt(d.usdt);
+            document.getElementById('btc').textContent = fmt(d.btc, 6);
+
+            // Signal
+            const sigEl = document.getElementById('signal');
+            sigEl.textContent = d.signal;
+            sigEl.className = 'text-xl font-bold ' + (
+                d.signal === 'BUY' ? 'text-[#00e396]' :
+                d.signal.includes('SELL') ? 'text-[#ff4560]' : 'text-gray-400'
+            );
+
+            // Confidence
+            const pct = (d.buy_proba * 100);
+            document.getElementById('confidence').textContent = pct.toFixed(0) + '%';
+            document.getElementById('confidence-bar').style.width = pct + '%';
+            const barColor = pct >= 60 ? '#00e396' : pct >= 40 ? '#feb019' : '#ff4560';
+            document.getElementById('confidence-bar').style.backgroundColor = barColor;
+
+            // Position
+            const banner = document.getElementById('position-banner');
+            const pnlCard = document.getElementById('pnl-card');
+            if (d.entry_price) {
+                banner.style.display = 'block';
+                pnlCard.style.display = 'block';
+                document.getElementById('entry-price').textContent = fmt(d.entry_price);
+                document.getElementById('entry-qty').textContent = fmt(d.entry_qty, 6);
+
+                const pnlPct = d.pnl_pct;
+                const pnlUsd = d.pnl_usd;
+                const pnlColor = pnlUsd >= 0 ? 'text-[#00e396]' : 'text-[#ff4560]';
+
+                document.getElementById('pnl').className = 'text-xl font-bold ' + pnlColor;
+                document.getElementById('pnl').textContent = fmtPct(pnlPct);
+                document.getElementById('pnl-usd').textContent = '$' + fmt(pnlUsd);
+
+                document.getElementById('pos-pnl-pct').className = 'text-lg font-bold ' + pnlColor;
+                document.getElementById('pos-pnl-pct').textContent = fmtPct(pnlPct);
+                document.getElementById('pos-pnl-usd').textContent = '$' + fmt(pnlUsd);
+
+                banner.className = 'card p-4 mb-6 ' + (pnlUsd >= 0 ? 'glow-green' : 'glow-red');
+            } else {
+                banner.style.display = 'none';
+                pnlCard.style.display = 'none';
+            }
+
+            // Features radar
+            if (d.features) updateFeaturesChart(d.features);
+
+        } catch (e) {
+            console.error('Status update error:', e);
+        }
+    }
+
+    // --- Aggiorna Trades ---
+    async function updateTrades() {
+        try {
+            const res = await fetch('/api/trades');
+            const trades = await res.json();
+            const tbody = document.getElementById('trades-body');
+
+            if (!trades.length) {
+                tbody.innerHTML = '<tr><td colspan="6" class="py-4 text-center text-gray-500">Nessun trade</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = trades.slice(0, 20).map(t => {
+                const isBuy = t.side === 'BUY';
+                const sideColor = isBuy ? 'text-[#00e396]' : 'text-[#ff4560]';
+                const pnl = t.pnl_usd && t.pnl_usd !== '' ? parseFloat(t.pnl_usd) : null;
+                const pnlColor = pnl === null ? '' : pnl >= 0 ? 'text-[#00e396]' : 'text-[#ff4560]';
+                return `<tr class="border-b border-gray-800 hover:bg-gray-800/50">
+                    <td class="py-2 text-xs">${t.timestamp || '—'}</td>
+                    <td class="py-2 font-medium ${sideColor}">${t.side}</td>
+                    <td class="py-2 text-right">${fmt(t.qty, 6)}</td>
+                    <td class="py-2 text-right">$${fmt(t.price)}</td>
+                    <td class="py-2 text-right">${t.confidence ? (parseFloat(t.confidence)*100).toFixed(0)+'%' : '—'}</td>
+                    <td class="py-2 text-right ${pnlColor}">${pnl !== null ? '$'+fmt(pnl) : '—'}</td>
+                </tr>`;
+            }).join('');
+        } catch (e) {
+            console.error('Trades update error:', e);
+        }
+    }
+
+    // --- Equity Chart ---
+    async function updateEquityChart() {
+        try {
+            const res = await fetch('/api/equity');
+            const data = await res.json();
+
+            const labels = data.map(d => d.timestamp ? d.timestamp.substring(5, 16) : 'Start');
+            const values = data.map(d => d.equity);
+
+            if (equityChart) {
+                equityChart.data.labels = labels;
+                equityChart.data.datasets[0].data = values;
+                equityChart.update('none');
+            } else {
+                const ctx = document.getElementById('equity-chart').getContext('2d');
+                equityChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [{
+                            label: 'Equity ($)',
+                            data: values,
+                            borderColor: '#008ffb',
+                            backgroundColor: 'rgba(0, 143, 251, 0.1)',
+                            fill: true,
+                            tension: 0.3,
+                            pointRadius: 3,
+                            pointBackgroundColor: '#008ffb',
+                            borderWidth: 2,
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { display: false } },
+                        scales: {
+                            x: { ticks: { color: '#6b7280', maxTicksLimit: 8 }, grid: { color: '#1e2433' } },
+                            y: { ticks: { color: '#6b7280', callback: v => '$' + v }, grid: { color: '#1e2433' } }
+                        }
+                    }
+                });
+            }
+        } catch (e) {
+            console.error('Equity chart error:', e);
+        }
+    }
+
+    // --- Features Radar ---
+    function updateFeaturesChart(features) {
+        // Seleziona le feature piu' interpretabili per il radar
+        const keys = ['rsi', 'macd', 'bb_width', 'stoch_k', 'rsi_slope', 'atr_ratio', 'vol_regime',
+                       'rsi_4h', 'trend_4h', 'trend_1d'];
+        const available = keys.filter(k => k in features);
+        const values = available.map(k => features[k]);
+
+        // Normalizza i valori tra 0 e 1 per visualizzazione radar
+        const maxAbs = Math.max(...values.map(Math.abs), 1);
+        const normalized = values.map(v => (v + maxAbs) / (2 * maxAbs));
+
+        if (featuresChart) {
+            featuresChart.data.labels = available;
+            featuresChart.data.datasets[0].data = normalized;
+            featuresChart.update('none');
+        } else {
+            const ctx = document.getElementById('features-chart').getContext('2d');
+            featuresChart = new Chart(ctx, {
+                type: 'radar',
+                data: {
+                    labels: available,
+                    datasets: [{
+                        label: 'Features',
+                        data: normalized,
+                        borderColor: '#008ffb',
+                        backgroundColor: 'rgba(0, 143, 251, 0.15)',
+                        pointBackgroundColor: '#008ffb',
+                        borderWidth: 2,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        r: {
+                            grid: { color: '#1e2433' },
+                            angleLines: { color: '#1e2433' },
+                            ticks: { display: false },
+                            pointLabels: { color: '#9ca3af', font: { size: 10 } },
+                            suggestedMin: 0,
+                            suggestedMax: 1,
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // --- Init & Auto-refresh ---
+    async function refresh() {
+        await Promise.all([updateStatus(), updateTrades(), updateEquityChart()]);
+    }
+    refresh();
+    setInterval(refresh, 30000);
+</script>
+</body>
+</html>

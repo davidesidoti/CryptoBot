@@ -60,6 +60,7 @@ LOG_FILE        = "trades_log.csv"
 RETRAIN_HOURS   = 24            # riaddestra il modello ogni N ore
 MODEL_FILE      = "model.joblib"
 STATE_FILE      = "bot_state.json"
+DASHBOARD_FILE  = "dashboard_data.json"
 
 FEATURES = [
     "rsi", "macd", "macd_signal", "bb_width",
@@ -635,6 +636,30 @@ def load_state():
     return None, None
 
 
+def save_dashboard_data(price, buy_proba, signal_str, usdt, btc,
+                        entry_price, entry_qty, features_row):
+    """Salva snapshot del ciclo corrente per la dashboard web."""
+    data = {
+        "timestamp": pd.Timestamp.now().isoformat(),
+        "price": price,
+        "buy_proba": round(buy_proba, 4),
+        "signal": signal_str,
+        "usdt": round(usdt, 2),
+        "btc": round(btc, 8),
+        "entry_price": entry_price,
+        "entry_qty": entry_qty,
+        "pnl_pct": round((price - entry_price) / entry_price, 4) if entry_price else None,
+        "pnl_usd": round((price - entry_price) * (entry_qty or 0), 2) if entry_price else None,
+        "features": {k: round(v, 4) if isinstance(v, float) else v
+                     for k, v in features_row.items()},
+        "sleep_seconds": SLEEP_SECONDS,
+        "stop_loss": STOP_LOSS,
+        "min_proba": MIN_PROBA,
+    }
+    with open(DASHBOARD_FILE, "w") as f:
+        json.dump(data, f, indent=2, default=str)
+
+
 def save_model(model):
     """Salva il modello su disco con joblib."""
     joblib.dump(model, MODEL_FILE)
@@ -701,7 +726,7 @@ def run_bot(model):
 
     last_retrain = time.time()
     last_status  = time.time()
-    STATUS_INTERVAL = 1800  # notifica stato ogni 30 minuti
+    STATUS_INTERVAL = 86400  # notifica stato ogni 24 ore
     send_telegram(
         f"🤖 <b>Bot avviato</b>\n"
         f"📈 {SYMBOL} | {TIMEFRAME}\n"
@@ -747,6 +772,16 @@ def run_bot(model):
                 f"Signal: {signal_str} (BUY prob: {buy_proba:.0%}) | "
                 f"USDT: {usdt:.2f} | BTC: {btc:.6f}"
             )
+
+            # --- Aggiorna dati dashboard ---
+            try:
+                save_dashboard_data(
+                    price, buy_proba, signal_str, usdt, btc,
+                    entry_price, entry_qty,
+                    df_feat[FEATURES].iloc[-1].to_dict()
+                )
+            except Exception as e:
+                print(f"[DASHBOARD] Errore salvataggio: {e}")
 
             # --- Notifica stato periodica (ogni 30 min, solo lettura) ---
             if (time.time() - last_status) >= STATUS_INTERVAL:

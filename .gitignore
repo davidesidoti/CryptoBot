@@ -216,3 +216,4 @@ MLStrategy.html
 trades_log.csv
 model.joblib
 bot_state.json
+dashboard_data.json
