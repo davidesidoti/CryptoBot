@@ -32,14 +32,15 @@ The old `testnet.binance.vision` is deprecated — ccxt uses `exchange.enable_de
 Single-file bot (`cryptobot.py`). The pipeline runs sequentially:
 
 ```
-fetch_ohlcv()            → downloads 5000 OHLCV candles (paginated) from Binance public API
-build_features()         → adds 20 features (1h + 4h + 1d multi-timeframe) + dynamic ATR target
-walk_forward_train()     → binary XGBClassifier (BUY vs NO-BUY), 17 sliding folds
+fetch_ohlcv()            → downloads 10000 OHLCV candles (paginated, ~416 days) from Binance public API
+build_features()         → adds 23 features (1h + 4h + 1d multi-timeframe) + dynamic ATR target
+optimize_hyperparams()   → Optuna bayesian search (50 trials), cached in best_params.json for 48h
+walk_forward_train()     → binary XGBClassifier (BUY vs NO-BUY), ~41 sliding folds, uses Optuna params
 backtest()               → backtesting.py, INITIAL_CASH (default $500), 0.1% commission, P&L in $
 run_bot()                → live loop on Binance Testnet every SLEEP_SECONDS
 ```
 
-The model is binary: BUY (1) vs NO-BUY (0). `predict_proba` for BUY must exceed `MIN_PROBA` (0.60) to place a live order. SELL signals come from technical rules (RSI, MACD, EMA), not from the ML model.
+The model is binary: BUY (1) vs NO-BUY (0). `predict_proba` for BUY must exceed `MIN_PROBA` (0.55) to place a live order. SELL signals come from technical rules (RSI > 75, MACD 2-bar confirmed cross, EMA20 break > 0.8%), not from the ML model. `MIN_HOLD_BARS = 5` suppresses SELL for 5h after BUY (stop loss always fires).
 
 ## Key constraints
 
@@ -60,11 +61,15 @@ The model is binary: BUY (1) vs NO-BUY (0). `predict_proba` for BUY must exceed 
 - **Telegram HTML mode**: use `&amp;` not `&` (e.g. `P&amp;L`) — bare `&` causes silent drop.
 - **Binance Demo Trading keys**: keys from `demo.binance.com` and keys from `testnet.binance.vision`
   are not interchangeable — they are separate systems.
+- **Optuna cache**: `best_params.json` has 48h TTL; delete to force re-optimization.
+- **Dashboard**: `dashboard.py` (Flask on port 5050) reads `dashboard_data.json` written by bot each cycle. Run as separate process.
+- **Degenerate folds**: now use previous fold's model as fallback instead of zeroing predictions.
+- **`save_state()` entry_time**: old state files without `entry_time` are handled gracefully (sell not blocked).
 
-## Features used by the model (20 total)
+## Features used by the model (23 total)
 
-**1h base**: `rsi`, `macd`, `macd_signal`, `bb_width`, `vol_change`, `price_change`, `ema_cross`, `atr`, `obv_change`, `stoch_k`, `rsi_slope`, `hour`
-**Multi-timeframe**: `rsi_4h`, `macd_4h`, `ema_cross_4h`, `trend_4h`, `rsi_1d`, `trend_1d`
+**1h base**: `rsi`, `macd`, `macd_signal`, `bb_width`, `vol_change`, `price_change`, `ema_cross`, `atr`, `obv_change`, `stoch_k`, `rsi_slope`, `hour`, `adx`, `willr`, `vwap_dist`
+**Multi-timeframe**: `rsi_4h`, `macd_4h`, `ema_cross_4h`, `trend_4h`, `rsi_1d`, `adx_1d`
 **Regime**: `atr_ratio`, `vol_regime`
 
 Defined in the `FEATURES` list at the top of `cryptobot.py` — adding a feature requires updating both `build_features()` and this list.

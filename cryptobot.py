@@ -22,7 +22,9 @@ from xgboost import XGBClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 from backtesting import Backtest, Strategy
+import optuna
 
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 warnings.filterwarnings("ignore")
 
 # Carica le variabili dal file .env (deve stare nella stessa cartella del bot)
@@ -48,15 +50,16 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
 
 SYMBOL          = "BTC/USDT"
 TIMEFRAME       = "1h"        # candele orarie
-FETCH_LIMIT     = 5000        # quante candele storiche scaricare (paginato)
+FETCH_LIMIT     = 10000       # quante candele storiche scaricare (paginato, ~416 giorni)
 N_TRAIN         = 400         # candele usate per il training
-FUTURE_BARS     = 3           # quante candele in avanti per calcolare il label
+FUTURE_BARS     = 5           # quante candele in avanti per calcolare il label
 SIGNAL_THRESH   = 0.007       # 0.7% di movimento minimo per generare segnale
-MIN_PROBA       = 0.60        # confidenza minima per eseguire un ordine
+MIN_PROBA       = 0.55        # confidenza minima per eseguire un ordine
 TRADE_SIZE      = 0.95        # % del capitale usata per ogni trade
 STOP_LOSS       = 0.02        # 2% stop loss — chiude posizione se la perdita supera questa soglia
 INITIAL_CASH    = 500         # capitale iniziale per il backtest (in USD)
-SLEEP_SECONDS   = 1800        # secondi tra ogni ciclo del bot (30 min)
+SLEEP_SECONDS   = 900         # secondi tra ogni ciclo del bot (15 min)
+MIN_HOLD_BARS   = 5           # hold minimo 5h prima di SELL tecnico (= FUTURE_BARS, stop loss escluso)
 LOG_FILE        = "trades_log.csv"
 RETRAIN_HOURS   = 24            # riaddestra il modello ogni N ore
 MODEL_FILE      = "model.joblib"
@@ -67,9 +70,11 @@ FEATURES = [
     "rsi", "macd", "macd_signal", "bb_width",
     "vol_change", "price_change", "ema_cross",
     "atr", "obv_change", "stoch_k", "rsi_slope", "hour",
+    # Nuove features
+    "adx", "willr", "vwap_dist",
     # Multi-timeframe features (resampled da 1h)
     "rsi_4h", "macd_4h", "ema_cross_4h", "trend_4h",
-    "rsi_1d", "trend_1d",
+    "rsi_1d", "adx_1d",
     # Regime / volatilita'
     "atr_ratio", "vol_regime"
 ]
@@ -169,6 +174,16 @@ def build_features(df):
     df["ema_20"]      = ta.ema(df["close"], length=20)
     df["trend_up"]    = (df["close"] > df["ema_20"]).astype(int)
 
+    # Nuove features
+    adx_df            = ta.adx(df["high"], df["low"], df["close"], length=14)
+    df["adx"]         = adx_df["ADX_14"]          # forza del trend (0-100)
+    df["willr"]       = ta.willr(df["high"], df["low"], df["close"], length=14)  # Williams %R
+    # VWAP distance: distanza % del prezzo dal VWAP rolling (proxy intraday)
+    cum_vol           = df["volume"].rolling(20).sum()
+    cum_vp            = (df["close"] * df["volume"]).rolling(20).sum()
+    vwap_20           = cum_vp / cum_vol
+    df["vwap_dist"]   = (df["close"] - vwap_20) / vwap_20  # >0 = sopra VWAP
+
     # === Feature multi-timeframe (resample da 1h) ===
     # 4h
     df_4h = df[["open", "high", "low", "close", "volume"]].resample("4h").agg({
@@ -193,9 +208,9 @@ def build_features(df):
         "close": "last", "volume": "sum"
     }).dropna()
     df_1d["rsi_1d"]   = ta.rsi(df_1d["close"], length=14)
-    ema20_1d          = ta.ema(df_1d["close"], length=20)
-    df_1d["trend_1d"] = (df_1d["close"] > ema20_1d).astype(int)
-    for col in ["rsi_1d", "trend_1d"]:
+    adx_1d_df         = ta.adx(df_1d["high"], df_1d["low"], df_1d["close"], length=14)
+    df_1d["adx_1d"]   = adx_1d_df["ADX_14"]  # forza trend daily (sostituisce trend_1d)
+    for col in ["rsi_1d", "adx_1d"]:
         df[col] = df_1d[col].reindex(df.index, method="ffill")
 
     # === Regime / volatilita' ===
@@ -262,7 +277,7 @@ def train_model(df):
         scale_pos_weight=spw,
         eval_metric="logloss",
         verbosity=0,
-        early_stopping_rounds=40
+        early_stopping_rounds=80
     )
     model.fit(
         X_train, y_train,
@@ -279,7 +294,83 @@ def train_model(df):
 
 
 # ─────────────────────────────────────────────
-# 3b. WALK-FORWARD VALIDATION
+# 3b. OTTIMIZZAZIONE IPERPARAMETRI (OPTUNA)
+# ─────────────────────────────────────────────
+
+OPTUNA_FILE = "best_params.json"
+OPTUNA_TRIALS = 50  # numero di trial per la ricerca
+
+
+def optimize_hyperparams(df, n_trials=OPTUNA_TRIALS):
+    """
+    Usa Optuna per trovare i migliori iperparametri XGBoost.
+    Valida su un split temporale (ultimi 20% del dataset).
+    Salva i risultati su best_params.json per riutilizzo.
+    """
+    # Se esiste un file recente (< 48h), riusa i parametri
+    if os.path.isfile(OPTUNA_FILE):
+        age_h = (time.time() - os.path.getmtime(OPTUNA_FILE)) / 3600
+        if age_h < 48:
+            with open(OPTUNA_FILE) as f:
+                params = json.load(f)
+            print(f"Iperparametri caricati da {OPTUNA_FILE} (eta': {age_h:.1f}h)")
+            return params
+
+    print(f"\n=== Ottimizzazione iperparametri ({n_trials} trial) ===")
+    X = df[FEATURES]
+    y = (df["label"] == 1).astype(int)
+
+    # Split temporale: train 70%, val 15%, test 15% (test non usato qui)
+    split_1 = int(len(X) * 0.70)
+    split_2 = int(len(X) * 0.85)
+    X_train, y_train = X.iloc[:split_1], y.iloc[:split_1]
+    X_val, y_val = X.iloc[split_1:split_2], y.iloc[split_1:split_2]
+
+    neg = (y_train == 0).sum()
+    pos = (y_train == 1).sum()
+    spw = min(neg / pos, 50.0) if pos > 0 else 1.0
+
+    def objective(trial):
+        params = {
+            "n_estimators": 500,
+            "max_depth": trial.suggest_int("max_depth", 3, 7),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+            "min_child_weight": trial.suggest_int("min_child_weight", 5, 30),
+            "subsample": trial.suggest_float("subsample", 0.6, 0.95),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 0.9),
+            "reg_alpha": trial.suggest_float("reg_alpha", 0.01, 2.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 5.0, log=True),
+            "scale_pos_weight": spw,
+            "eval_metric": "logloss",
+            "verbosity": 0,
+            "early_stopping_rounds": 80,
+        }
+        m = XGBClassifier(**params)
+        m.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+
+        # Obiettivo: massimizzare F1 della classe BUY
+        preds = m.predict(X_val)
+        from sklearn.metrics import f1_score
+        return f1_score(y_val, preds, pos_label=1, zero_division=0)
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    best = study.best_params
+    print(f"Migliori parametri trovati (F1 BUY: {study.best_value:.3f}):")
+    for k, v in best.items():
+        print(f"  {k}: {v}")
+
+    # Salva su disco
+    with open(OPTUNA_FILE, "w") as f:
+        json.dump(best, f, indent=2)
+    print(f"Salvati in {OPTUNA_FILE}")
+
+    return best
+
+
+# ─────────────────────────────────────────────
+# 3c. WALK-FORWARD VALIDATION
 # ─────────────────────────────────────────────
 
 def technical_sell_signal(df):
@@ -292,24 +383,26 @@ def technical_sell_signal(df):
     """
     sell = pd.Series(False, index=df.index)
 
-    # RSI ipercomprato + inizio discesa
-    sell |= (df["rsi"] > 70) & (df["rsi_slope"] < 0)
+    # RSI ipercomprato + inizio discesa (75 = vero ipercomprato per BTC)
+    sell |= (df["rsi"] > 75) & (df["rsi_slope"] < 0)
 
-    # MACD cross ribassista
-    sell |= (df["macd"] < df["macd_signal"]) & (df["macd"].diff() < 0)
+    # MACD cross ribassista confermato (gap in aumento per 2 barre consecutive)
+    macd_gap = df["macd"] - df["macd_signal"]
+    sell |= (macd_gap < 0) & (macd_gap.diff() < 0) & (macd_gap.shift(1).diff() < 0)
 
-    # Prezzo crolla sotto EMA20 con momentum
-    sell |= (df["trend_up"] == 0) & (df["price_change"] < -0.005)
+    # Prezzo crolla sotto EMA20 con momentum significativo (0.8%)
+    sell |= (df["trend_up"] == 0) & (df["price_change"] < -0.008)
 
     return sell
 
 
-def walk_forward_train(df):
+def walk_forward_train(df, best_params=None):
     """
     Walk-forward validation con binary classification (BUY vs NO-BUY).
     Il segnale SELL e' generato da regole tecniche, non dal modello ML.
     Per ogni finestra, genera predictions out-of-sample.
     Ritorna il modello allenato sull'ultimo fold e le predictions aggregate.
+    Se best_params e' fornito (da Optuna), usa quelli al posto dei default.
     """
     X = df[FEATURES]
     # Binary target: 1 = BUY, 0 = NO-BUY
@@ -321,6 +414,18 @@ def walk_forward_train(df):
     all_idx    = []
     n = len(df)
     fold = 0
+    prev_model = None  # fallback per fold degeneri
+    MIN_BUY_SAMPLES = 20  # minimo BUY nel training set
+
+    # Iperparametri: usa Optuna se disponibili, altrimenti default
+    hp = {
+        "max_depth": 4, "learning_rate": 0.03, "min_child_weight": 10,
+        "subsample": 0.8, "colsample_bytree": 0.7,
+        "reg_alpha": 0.3, "reg_lambda": 1.5,
+    }
+    if best_params:
+        hp.update(best_params)
+        print(f"Usando iperparametri ottimizzati (Optuna)")
 
     print(f"Walk-forward: train={WF_TRAIN_BARS}, test={WF_TEST_BARS}, "
           f"dataset={n} righe")
@@ -336,24 +441,24 @@ def walk_forward_train(df):
         X_test  = X.iloc[train_end:test_end]
         y_test  = y.iloc[train_end:test_end]
 
-        # scale_pos_weight per questo fold
+        # scale_pos_weight per questo fold (con cap a 50 per evitare estremi)
         neg_count = (y_train == 0).sum()
         pos_count = (y_train == 1).sum()
-        spw = neg_count / pos_count if pos_count > 0 else 1.0
+        spw = min(neg_count / pos_count, 50.0) if pos_count > 0 else 1.0
 
         model = XGBClassifier(
             n_estimators=500,
-            max_depth=4,
-            learning_rate=0.03,
-            min_child_weight=10,
-            subsample=0.8,
-            colsample_bytree=0.7,
-            reg_alpha=0.3,
-            reg_lambda=1.5,
+            max_depth=hp["max_depth"],
+            learning_rate=hp["learning_rate"],
+            min_child_weight=hp["min_child_weight"],
+            subsample=hp["subsample"],
+            colsample_bytree=hp["colsample_bytree"],
+            reg_alpha=hp["reg_alpha"],
+            reg_lambda=hp["reg_lambda"],
             scale_pos_weight=spw,
             eval_metric="logloss",
             verbosity=0,
-            early_stopping_rounds=40
+            early_stopping_rounds=80
         )
         model.fit(
             X_train, y_train,
@@ -361,15 +466,19 @@ def walk_forward_train(df):
             verbose=False
         )
 
-        # Guard: se il modello e' degenere (best_iter troppo basso),
-        # tratta tutte le predictions come NO-BUY per evitare falsi segnali
-        is_degenerate = model.best_iteration < 10
-        if is_degenerate:
+        # Guard per fold degeneri: usa modello precedente come fallback
+        is_degenerate = model.best_iteration < 10 or pos_count < MIN_BUY_SAMPLES
+        if is_degenerate and prev_model is not None:
+            # Riusa il modello del fold precedente (che era buono)
+            preds = prev_model.predict(X_test)
+            proba = prev_model.predict_proba(X_test)[:, 1]
+        elif is_degenerate:
             preds = np.zeros(len(X_test), dtype=int)
             proba = np.full(len(X_test), 0.0)
         else:
             preds = model.predict(X_test)
             proba = model.predict_proba(X_test)[:, 1]  # probabilita' BUY
+            prev_model = model  # salva come fallback
 
         all_preds.extend(preds)
         all_proba.extend(proba)
@@ -459,29 +568,36 @@ def backtest(df_raw, df_feat, model, pred_series=None, test_size=0.2):
                 name="Trend"
             )
             self.entry_price = None
+            self.bars_held = 0
 
         def next(self):
             sig = self.signal[-1]
             price = self.data.Close[-1]
             trend_ok = self.trend[-1] == 1
 
-            # Stop loss: chiudi long se la perdita supera STOP_LOSS
+            # Stop loss: chiudi long se la perdita supera STOP_LOSS (SEMPRE attivo)
             if self.position.is_long and self.entry_price:
+                self.bars_held += 1
                 loss = (price - self.entry_price) / self.entry_price
                 if loss <= -STOP_LOSS:
                     self.position.close()
                     self.entry_price = None
+                    self.bars_held = 0
                     return
 
             # BUY: entra long (solo se trend up e non gia' in posizione)
             if sig == 1 and not self.position and trend_ok:
                 self.buy(size=TRADE_SIZE)
                 self.entry_price = price
+                self.bars_held = 0
 
-            # SELL: chiudi long (solo se in posizione)
+            # SELL: chiudi long (solo se in posizione e hold minimo rispettato)
             elif sig == -1 and self.position.is_long:
+                if self.bars_held < MIN_HOLD_BARS:
+                    return  # hold minimo non raggiunto, stop loss gia' controllato sopra
                 self.position.close()
                 self.entry_price = None
+                self.bars_held = 0
 
     # backtesting.py richiede colonne con la prima lettera maiuscola
     bt_df = raw_aligned.rename(columns={
@@ -619,10 +735,14 @@ def send_telegram(message):
 # 5c. PERSISTENZA STATO E MODELLO
 # ─────────────────────────────────────────────
 
-def save_state(entry_price, entry_qty):
+def save_state(entry_price, entry_qty, entry_time=None):
     """Salva lo stato della posizione su file JSON."""
     with open(STATE_FILE, "w") as f:
-        json.dump({"entry_price": entry_price, "entry_qty": entry_qty}, f)
+        json.dump({
+            "entry_price": entry_price,
+            "entry_qty": entry_qty,
+            "entry_time": entry_time.isoformat() if entry_time else None,
+        }, f)
 
 
 def load_state():
@@ -631,10 +751,12 @@ def load_state():
         try:
             with open(STATE_FILE) as f:
                 s = json.load(f)
-            return s.get("entry_price"), s.get("entry_qty")
-        except (json.JSONDecodeError, KeyError):
+            et = s.get("entry_time")
+            entry_time = datetime.fromisoformat(et) if et else None
+            return s.get("entry_price"), s.get("entry_qty"), entry_time
+        except (json.JSONDecodeError, KeyError, ValueError):
             pass
-    return None, None
+    return None, None, None
 
 
 def save_dashboard_data(price, buy_proba, signal_str, usdt, btc,
@@ -720,7 +842,7 @@ def run_bot(model):
     print("=" * 55)
 
     # Carica stato precedente (sopravvive a restart)
-    entry_price, entry_qty = load_state()
+    entry_price, entry_qty, entry_time = load_state()
     if entry_price:
         print(f"Stato caricato: posizione aperta @ {entry_price:.2f} "
               f"({entry_qty} BTC)")
@@ -835,10 +957,19 @@ def run_bot(model):
                     )
                     entry_price = None
                     entry_qty = None
-                    save_state(entry_price, entry_qty)
+                    entry_time = None
+                    save_state(entry_price, entry_qty, entry_time)
                     print(f"  -> Prossimo ciclo tra {SLEEP_SECONDS // 60} minuti...\n")
                     time.sleep(SLEEP_SECONDS)
                     continue
+
+            # Hold minimo: sopprime SELL tecnico se posizione troppo giovane
+            # (stop loss sopra resta SEMPRE attivo)
+            if sell_signal and entry_time:
+                hours_held = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
+                if hours_held < MIN_HOLD_BARS:
+                    sell_signal = False
+                    print(f"  -> SELL soppresso: hold {hours_held:.1f}h < {MIN_HOLD_BARS}h minimo")
 
             if buy_signal and usdt > 10 and not entry_price:
                 # Filtro trend: compra solo se prezzo > EMA20
@@ -861,7 +992,8 @@ def run_bot(model):
                     )
                     entry_price = price
                     entry_qty = qty
-                    save_state(entry_price, entry_qty)
+                    entry_time = datetime.now(timezone.utc)
+                    save_state(entry_price, entry_qty, entry_time)
 
             elif sell_signal and btc > 0.0001 and entry_price:
                 # SELL tecnico: chiudi long
@@ -881,7 +1013,8 @@ def run_bot(model):
                 )
                 entry_price = None
                 entry_qty = None
-                save_state(entry_price, entry_qty)
+                entry_time = None
+                save_state(entry_price, entry_qty, entry_time)
 
             else:
                 print(f"  -> HOLD (nessuna azione)")
@@ -918,8 +1051,11 @@ if __name__ == "__main__":
         df_feat = build_features(df_raw)
         print(f"Dataset dopo feature engineering: {len(df_feat)} righe")
 
+        print("\n=== CRYPTOBOT: fase 2b - ottimizzazione iperparametri ===")
+        best_params = optimize_hyperparams(df_feat)
+
         print("\n=== CRYPTOBOT: fase 3 - walk-forward training ===")
-        model, wf_predictions = walk_forward_train(df_feat)
+        model, wf_predictions = walk_forward_train(df_feat, best_params=best_params)
 
         # Feature importance dall'ultimo modello
         print("\n=== Feature Importance (ultimo fold) ===")
@@ -936,4 +1072,4 @@ if __name__ == "__main__":
         backtest(df_raw, df_feat, model, pred_series=wf_predictions)
 
     # Decommenta la riga sotto per avviare il bot live sul testnet
-    run_bot(model)
+    #run_bot(model)
