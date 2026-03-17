@@ -1093,9 +1093,16 @@ if __name__ == "__main__":
     if model is not None:
         print("Modello caricato da disco - skip training.")
         print("Per forzare il retraining, cancella model.joblib\n")
+        # Genera price_history.json per la dashboard anche senza training
+        try:
+            df_raw = fetch_ohlcv()
+            save_price_history(df_raw)
+        except Exception:
+            pass
     else:
         print("=== CRYPTOBOT: fase 1 - download dati ===")
         df_raw  = fetch_ohlcv()
+        save_price_history(df_raw)
         print(f"Scaricate {len(df_raw)} candele per {SYMBOL} ({TIMEFRAME})")
 
         print("\n=== CRYPTOBOT: fase 2 - feature engineering ===")
