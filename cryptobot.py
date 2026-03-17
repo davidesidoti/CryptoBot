@@ -800,8 +800,8 @@ def save_dashboard_data(price, buy_proba, signal_str, usdt, btc,
 def save_price_history(df):
     """Salva le ultime 100 candele OHLCV per il chart candlestick della dashboard."""
     try:
-        recent = df.tail(100)[["timestamp", "open", "high", "low", "close", "volume"]].copy()
-        recent["timestamp"] = recent["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S")
+        recent = df.tail(100)[["open", "high", "low", "close", "volume"]].copy()
+        recent["timestamp"] = recent.index.strftime("%Y-%m-%dT%H:%M:%S")
         with open(PRICE_HISTORY_FILE, "w") as f:
             json.dump(recent.to_dict(orient="records"), f)
     except Exception as e:
@@ -1130,4 +1130,4 @@ if __name__ == "__main__":
         backtest(df_raw, df_feat, model, pred_series=wf_predictions)
 
     # Decommenta la riga sotto per avviare il bot live sul testnet
-    #run_bot(model)
+    run_bot(model)
