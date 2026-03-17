@@ -940,7 +940,7 @@ def run_bot(model):
             if entry_price and btc > 0.0001:
                 loss = (price - entry_price) / entry_price
                 if loss <= -STOP_LOSS:
-                    qty = round(btc * TRADE_SIZE, 6)
+                    qty = int(btc * 1e6) / 1e6  # tronca a 6 decimali (vendi tutto)
                     pnl_usd = (price - entry_price) * qty
                     exchange.create_order(SYMBOL, "market", "sell", qty)
                     print(f"  -> STOP LOSS: SELL {qty} BTC @ {price:.2f} "
@@ -959,6 +959,14 @@ def run_bot(model):
                     entry_qty = None
                     entry_time = None
                     save_state(entry_price, entry_qty, entry_time)
+                    # Aggiorna dashboard subito dopo stop loss
+                    try:
+                        bal = exchange.fetch_balance()
+                        save_dashboard_data(price, buy_proba, "STOP_LOSS",
+                            bal["USDT"]["free"], bal["BTC"]["free"],
+                            None, None, df_feat[FEATURES].iloc[-1].to_dict())
+                    except Exception:
+                        pass
                     print(f"  -> Prossimo ciclo tra {SLEEP_SECONDS // 60} minuti...\n")
                     time.sleep(SLEEP_SECONDS)
                     continue
@@ -994,10 +1002,19 @@ def run_bot(model):
                     entry_qty = qty
                     entry_time = datetime.now(timezone.utc)
                     save_state(entry_price, entry_qty, entry_time)
+                    # Aggiorna dashboard subito dopo BUY
+                    try:
+                        bal = exchange.fetch_balance()
+                        save_dashboard_data(price, buy_proba, "BUY",
+                            bal["USDT"]["free"], bal["BTC"]["free"],
+                            entry_price, entry_qty,
+                            df_feat[FEATURES].iloc[-1].to_dict())
+                    except Exception:
+                        pass
 
             elif sell_signal and btc > 0.0001 and entry_price:
-                # SELL tecnico: chiudi long
-                qty = round(btc * TRADE_SIZE, 6)
+                # SELL tecnico: chiudi long (vendi tutto il BTC)
+                qty = int(btc * 1e6) / 1e6  # tronca a 6 decimali
                 pnl_usd = (price - entry_price) * qty
                 pnl_pct = (price - entry_price) / entry_price
                 exchange.create_order(SYMBOL, "market", "sell", qty)
@@ -1015,6 +1032,14 @@ def run_bot(model):
                 entry_qty = None
                 entry_time = None
                 save_state(entry_price, entry_qty, entry_time)
+                # Aggiorna dashboard subito dopo SELL
+                try:
+                    bal = exchange.fetch_balance()
+                    save_dashboard_data(price, buy_proba, "SELL",
+                        bal["USDT"]["free"], bal["BTC"]["free"],
+                        None, None, df_feat[FEATURES].iloc[-1].to_dict())
+                except Exception:
+                    pass
 
             else:
                 print(f"  -> HOLD (nessuna azione)")
