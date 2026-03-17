@@ -640,7 +640,7 @@ def save_dashboard_data(price, buy_proba, signal_str, usdt, btc,
                         entry_price, entry_qty, features_row):
     """Salva snapshot del ciclo corrente per la dashboard web."""
     data = {
-        "timestamp": pd.Timestamp.now().isoformat(),
+        "timestamp": pd.Timestamp.utcnow().isoformat() + "Z",
         "price": price,
         "buy_proba": round(buy_proba, 4),
         "signal": signal_str,
