@@ -62,7 +62,7 @@ The model is binary: BUY (1) vs NO-BUY (0). `predict_proba` for BUY must exceed 
 - **Binance Demo Trading keys**: keys from `demo.binance.com` and keys from `testnet.binance.vision`
   are not interchangeable — they are separate systems.
 - **Optuna cache**: `best_params.json` has 48h TTL; delete to force re-optimization.
-- **Dashboard**: `dashboard.py` (Flask on port 5050) reads `dashboard_data.json` written by bot each cycle. Run as separate process.
+- **Dashboard**: `dashboard.py` (Flask on port 5050) reads `dashboard_data.json` and `price_history.json` written by bot each cycle. Run as separate process. Endpoints: `/api/status`, `/api/trades`, `/api/equity`, `/api/candles`.
 - **Degenerate folds**: now use previous fold's model as fallback instead of zeroing predictions.
 - **`save_state()` entry_time**: old state files without `entry_time` are handled gracefully (sell not blocked).
 

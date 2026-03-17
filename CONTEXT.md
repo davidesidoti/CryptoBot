@@ -222,10 +222,15 @@ python dashboard.py
 # Apri http://localhost:5050 (o http://IP_VPS:5050)
 ```
 
-Dashboard web (Flask + Tailwind CSS + Chart.js) con:
-- Cards: prezzo BTC, segnale, confidenza ML, saldo USDT/BTC, P&L
+Dashboard web (Flask + Tailwind CSS + Chart.js + Lightweight Charts) con:
+- Cards: prezzo BTC (con sparkline), segnale, confidenza ML, saldo USDT/BTC, P&L
+- Countdown bar al prossimo ciclo bot (aggiornamento ogni secondo)
+- Flash + count-up animato sui numeri quando cambiano
+- Grafico candlestick BTC/USDT (ultime 100 candele 1h, TradingView Lightweight Charts)
 - Equity curve interattiva
 - Radar delle feature ML
+- Activity feed delle azioni recenti del bot
+- Toast notification animati per nuovi trade
 - Tabella ultimi 20 trade
 - Dark theme, responsive, auto-refresh 30s
 

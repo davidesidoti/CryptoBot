@@ -16,6 +16,7 @@ app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DASHBOARD_FILE = os.path.join(BASE_DIR, "dashboard_data.json")
 TRADES_FILE = os.path.join(BASE_DIR, "trades_log.csv")
+PRICE_HISTORY_FILE = os.path.join(BASE_DIR, "price_history.json")
 
 
 @app.route("/")
@@ -70,6 +71,16 @@ def equity():
                 "equity": round(equity, 2)
             })
     return jsonify(curve)
+
+
+@app.route("/api/candles")
+def candles():
+    """Ritorna le ultime 100 candele OHLCV per il chart candlestick."""
+    if not os.path.isfile(PRICE_HISTORY_FILE):
+        return jsonify([])
+    with open(PRICE_HISTORY_FILE) as f:
+        data = json.load(f)
+    return jsonify(data)
 
 
 if __name__ == "__main__":

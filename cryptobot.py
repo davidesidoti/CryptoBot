@@ -65,6 +65,7 @@ RETRAIN_HOURS   = 24            # riaddestra il modello ogni N ore
 MODEL_FILE      = "model.joblib"
 STATE_FILE      = "bot_state.json"
 DASHBOARD_FILE  = "dashboard_data.json"
+PRICE_HISTORY_FILE = "price_history.json"
 
 FEATURES = [
     "rsi", "macd", "macd_signal", "bb_width",
@@ -762,6 +763,18 @@ def load_state():
 def save_dashboard_data(price, buy_proba, signal_str, usdt, btc,
                         entry_price, entry_qty, features_row):
     """Salva snapshot del ciclo corrente per la dashboard web."""
+    # Accumula ultimi 20 prezzi per sparkline
+    sparkline = []
+    if os.path.isfile(DASHBOARD_FILE):
+        try:
+            with open(DASHBOARD_FILE) as f:
+                old = json.load(f)
+            sparkline = old.get("sparkline", [])
+        except (json.JSONDecodeError, KeyError):
+            pass
+    sparkline.append(round(price, 2))
+    sparkline = sparkline[-20:]
+
     data = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "price": price,
@@ -775,12 +788,24 @@ def save_dashboard_data(price, buy_proba, signal_str, usdt, btc,
         "pnl_usd": round((price - entry_price) * (entry_qty or 0), 2) if entry_price else None,
         "features": {k: round(v, 4) if isinstance(v, float) else v
                      for k, v in features_row.items()},
+        "sparkline": sparkline,
         "sleep_seconds": SLEEP_SECONDS,
         "stop_loss": STOP_LOSS,
         "min_proba": MIN_PROBA,
     }
     with open(DASHBOARD_FILE, "w") as f:
         json.dump(data, f, indent=2, default=str)
+
+
+def save_price_history(df):
+    """Salva le ultime 100 candele OHLCV per il chart candlestick della dashboard."""
+    try:
+        recent = df.tail(100)[["timestamp", "open", "high", "low", "close", "volume"]].copy()
+        recent["timestamp"] = recent["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S")
+        with open(PRICE_HISTORY_FILE, "w") as f:
+            json.dump(recent.to_dict(orient="records"), f)
+    except Exception as e:
+        print(f"[WARN] save_price_history fallito: {e}")
 
 
 def save_model(model):
@@ -874,6 +899,7 @@ def run_bot(model):
                 last_retrain = time.time()  # reset timer anche se fallito
 
             df      = fetch_ohlcv()
+            save_price_history(df)
             df_feat = build_features(df)
 
             last_row   = df_feat[FEATURES].iloc[-1:]
