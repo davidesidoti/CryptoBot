@@ -1,0 +1,888 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CryptoBot Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+    <script src="https://unpkg.com/lightweight-charts@4/dist/lightweight-charts.standalone.production.js"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        dark: { 800: '#1a1a2e', 700: '#16213e', 600: '#0f3460', 500: '#1a1a3e' },
+                        accent: { green: '#00e396', red: '#ff4560', blue: '#008ffb', yellow: '#feb019' }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { background: #0d1117; color: #e6edf3; font-family: 'Segoe UI', system-ui, sans-serif; }
+        .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; }
+        .glow-green { box-shadow: 0 0 12px rgba(0, 227, 150, 0.15); }
+        .glow-red { box-shadow: 0 0 12px rgba(255, 69, 96, 0.15); }
+        .pulse { animation: pulse 2s ease-in-out infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #161b22; }
+        ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+
+        /* Flash animation for cards on value change */
+        @keyframes flash-border {
+            0% { border-color: #008ffb; box-shadow: 0 0 15px rgba(0, 143, 251, 0.3); }
+            100% { border-color: #30363d; box-shadow: none; }
+        }
+        .flash { animation: flash-border 0.8s ease-out; }
+
+        /* Toast animations */
+        @keyframes slide-in {
+            from { transform: translateX(120%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        @keyframes slide-out {
+            from { transform: translateX(0); opacity: 1; }
+            to { transform: translateX(120%); opacity: 0; }
+        }
+        .toast-in { animation: slide-in 0.35s ease-out; }
+        .toast-out { animation: slide-out 0.3s ease-in forwards; }
+    </style>
+</head>
+<body class="min-h-screen p-4 md:p-6">
+
+    <!-- Toast Container -->
+    <div id="toast-container" class="fixed top-4 right-4 z-50 flex flex-col gap-2"></div>
+
+    <!-- Header -->
+    <div class="flex items-center justify-between mb-4">
+        <div class="flex items-center gap-3">
+            <div class="text-2xl font-bold">
+                <span class="text-white">Crypto</span><span class="text-[#008ffb]">Bot</span>
+            </div>
+            <span class="text-xs px-2 py-1 rounded-full bg-[#008ffb]/20 text-[#008ffb]">BTC/USDT</span>
+        </div>
+        <div class="flex items-center gap-3 text-sm text-gray-400">
+            <div id="bot-status" class="flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-gray-500"></span>
+                <span>Caricamento...</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Countdown Bar -->
+    <div id="countdown-section" class="mb-5" style="display:none">
+        <div class="flex items-center justify-between text-xs text-gray-400 mb-1.5">
+            <span>Ultimo aggiornamento: <span id="relative-time" class="text-gray-300">—</span></span>
+            <span>Prossimo ciclo: <span id="countdown-text" class="text-gray-300">—</span></span>
+        </div>
+        <div class="w-full bg-gray-700/50 rounded-full h-1.5 overflow-hidden">
+            <div id="countdown-bar" class="h-1.5 rounded-full bg-[#008ffb] transition-all duration-1000 ease-linear" style="width: 0%"></div>
+        </div>
+    </div>
+
+    <!-- Metric Cards -->
+    <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-3 mb-6">
+        <div id="card-price" class="card p-4">
+            <div class="text-xs text-gray-400 mb-1">Prezzo BTC</div>
+            <div id="price" class="text-xl font-bold text-white">—</div>
+            <div style="position:relative; height:32px;" class="mt-2">
+                <canvas id="sparkline"></canvas>
+            </div>
+        </div>
+        <div id="card-signal" class="card p-4">
+            <div class="text-xs text-gray-400 mb-1">Segnale</div>
+            <div id="signal" class="text-xl font-bold">—</div>
+        </div>
+        <div id="card-confidence" class="card p-4">
+            <div class="text-xs text-gray-400 mb-1">Confidenza ML</div>
+            <div id="confidence" class="text-xl font-bold text-[#008ffb]">—</div>
+            <div class="w-full bg-gray-700 rounded-full h-1.5 mt-2">
+                <div id="confidence-bar" class="h-1.5 rounded-full bg-[#008ffb] transition-all duration-500" style="width: 0%"></div>
+            </div>
+        </div>
+        <div id="card-usdt" class="card p-4">
+            <div class="text-xs text-gray-400 mb-1">Saldo USDT</div>
+            <div id="usdt" class="text-xl font-bold text-white">—</div>
+        </div>
+        <div id="card-btc" class="card p-4">
+            <div class="text-xs text-gray-400 mb-1">Saldo BTC</div>
+            <div id="btc" class="text-xl font-bold text-white">—</div>
+        </div>
+        <div id="pnl-card" class="card p-4" style="display:none">
+            <div class="text-xs text-gray-400 mb-1">P&L Posizione</div>
+            <div id="pnl" class="text-xl font-bold">—</div>
+            <div id="pnl-usd" class="text-xs text-gray-400">—</div>
+        </div>
+    </div>
+
+    <!-- Position Banner -->
+    <div id="position-banner" class="card p-4 mb-6" style="display:none">
+        <div class="flex items-center justify-between flex-wrap gap-3">
+            <div class="flex items-center gap-3">
+                <span class="text-lg">📌</span>
+                <div>
+                    <div class="text-sm text-gray-400">Posizione aperta</div>
+                    <div class="text-white font-medium">
+                        Entry: $<span id="entry-price">—</span>
+                        &nbsp;|&nbsp;
+                        Qty: <span id="entry-qty">—</span> BTC
+                    </div>
+                </div>
+            </div>
+            <div id="position-pnl" class="text-right">
+                <div id="pos-pnl-pct" class="text-lg font-bold">—</div>
+                <div id="pos-pnl-usd" class="text-sm text-gray-400">—</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Candlestick Chart -->
+    <div class="card p-4 mb-6">
+        <div class="text-sm font-medium text-gray-300 mb-3">Grafico BTC/USDT (1h)</div>
+        <div id="candlestick-container" style="height: 350px;">
+            <div id="candle-placeholder" class="flex items-center justify-center h-full text-gray-500 text-sm">
+                Caricamento candele...
+            </div>
+        </div>
+    </div>
+
+    <!-- Charts -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 mb-6">
+        <div class="card p-4">
+            <div class="text-sm font-medium text-gray-300 mb-3">Equity Curve</div>
+            <div style="position: relative; height: 280px;">
+                <canvas id="equity-chart"></canvas>
+            </div>
+        </div>
+        <div class="card p-4">
+            <div class="text-sm font-medium text-gray-300 mb-3">Features Radar</div>
+            <div style="position: relative; height: 280px;">
+                <canvas id="features-chart"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <!-- Signal Details Panel -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+        <!-- Current Decision -->
+        <div class="card p-4">
+            <div class="text-sm font-medium text-gray-300 mb-3">Decisione Corrente</div>
+            <div id="decision-panel" class="space-y-3">
+                <div class="flex items-center justify-between">
+                    <span class="text-xs text-gray-400">Azione</span>
+                    <span id="dec-action" class="text-sm font-bold text-white">—</span>
+                </div>
+                <div class="text-xs text-gray-400 leading-relaxed" id="dec-reason">—</div>
+                <div class="border-t border-gray-700 pt-2 space-y-1.5">
+                    <div class="flex items-center justify-between">
+                        <span class="text-xs text-gray-400">Trend EMA20</span>
+                        <span id="dec-trend" class="text-xs font-medium">—</span>
+                    </div>
+                    <div class="flex items-center justify-between">
+                        <span class="text-xs text-gray-400">Posizione</span>
+                        <span id="dec-pos" class="text-xs font-medium text-gray-300">—</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Dual Model Confidence -->
+        <div class="card p-4">
+            <div class="text-sm font-medium text-gray-300 mb-3">Modelli ML</div>
+            <div class="space-y-4">
+                <div>
+                    <div class="flex items-center justify-between mb-1">
+                        <span class="text-xs text-gray-400">BUY (Long)</span>
+                        <span id="ml-buy-pct" class="text-sm font-bold text-[#00e396]">—</span>
+                    </div>
+                    <div class="w-full bg-gray-700 rounded-full h-2">
+                        <div id="ml-buy-bar" class="h-2 rounded-full bg-[#00e396] transition-all duration-500" style="width:0%"></div>
+                    </div>
+                    <div class="text-[10px] text-gray-500 mt-0.5">Soglia: <span id="ml-buy-thresh">55%</span></div>
+                </div>
+                <div>
+                    <div class="flex items-center justify-between mb-1">
+                        <span class="text-xs text-gray-400">SHORT</span>
+                        <span id="ml-short-pct" class="text-sm font-bold text-[#ff4560]">—</span>
+                    </div>
+                    <div class="w-full bg-gray-700 rounded-full h-2">
+                        <div id="ml-short-bar" class="h-2 rounded-full bg-[#ff4560] transition-all duration-500" style="width:0%"></div>
+                    </div>
+                    <div class="text-[10px] text-gray-500 mt-0.5">Soglia: <span id="ml-short-thresh">60%</span></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Signal Log (scrollable) -->
+        <div class="card p-4">
+            <div class="text-sm font-medium text-gray-300 mb-3">Signal Log</div>
+            <div id="signal-log" class="max-h-52 overflow-y-auto space-y-1 text-xs font-mono">
+                <div class="text-gray-500 py-2 text-center">Caricamento...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Activity Feed (trades) -->
+    <div class="card p-4 mb-6">
+        <div class="text-sm font-medium text-gray-300 mb-3">Attivita' Recente</div>
+        <div id="activity-feed" class="max-h-52 overflow-y-auto space-y-1.5">
+            <div class="text-sm text-gray-500 py-2 text-center">Caricamento...</div>
+        </div>
+    </div>
+
+    <!-- Trades Table -->
+    <div class="card p-4">
+        <div class="text-sm font-medium text-gray-300 mb-3">Trade Recenti</div>
+        <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead>
+                    <tr class="text-gray-400 text-xs border-b border-gray-700">
+                        <th class="pb-2 text-left">Data</th>
+                        <th class="pb-2 text-left">Side</th>
+                        <th class="pb-2 text-right">Qty</th>
+                        <th class="pb-2 text-right">Prezzo</th>
+                        <th class="pb-2 text-right">Confidenza</th>
+                        <th class="pb-2 text-right">P&L</th>
+                    </tr>
+                </thead>
+                <tbody id="trades-body" class="text-gray-300">
+                    <tr><td colspan="6" class="py-4 text-center text-gray-500">Caricamento...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <div class="text-center text-xs text-gray-600 mt-6">
+        Auto-refresh ogni 30s &nbsp;|&nbsp; CryptoBot Dashboard
+    </div>
+
+<script>
+    let equityChart = null;
+    let featuresChart = null;
+    let sparklineChart = null;
+    let candleChart = null;
+    let candleSeries = null;
+    let volumeSeries = null;
+
+    // --- State for animations ---
+    let prevValues = {};         // previous numeric values for count-up
+    let animFrames = {};         // active requestAnimationFrame IDs
+    let lastTimestamp = null;    // last bot update timestamp (ms)
+    let sleepSeconds = 900;      // default, updated from API
+    let prevTradeCount = null;   // for toast detection
+    let lastStatusData = null;   // for activity feed current signal
+
+    // --- Formattazione ---
+    const fmt = (n, d=2) => n != null ? Number(n).toLocaleString('en-US', {minimumFractionDigits: d, maximumFractionDigits: d}) : '—';
+    const fmtPct = (n) => n != null ? (n >= 0 ? '+' : '') + (n * 100).toFixed(2) + '%' : '—';
+
+    // --- Count-up animation ---
+    function countUp(elId, from, to, duration, formatter) {
+        // Cancel any running animation on this element
+        if (animFrames[elId]) cancelAnimationFrame(animFrames[elId]);
+
+        const el = document.getElementById(elId);
+        if (!el || from === to) return;
+
+        const start = performance.now();
+        const diff = to - from;
+
+        function tick(now) {
+            const elapsed = now - start;
+            const progress = Math.min(elapsed / duration, 1);
+            // Ease-out quad
+            const eased = 1 - (1 - progress) * (1 - progress);
+            const current = from + diff * eased;
+            el.textContent = formatter(current);
+
+            if (progress < 1) {
+                animFrames[elId] = requestAnimationFrame(tick);
+            } else {
+                delete animFrames[elId];
+            }
+        }
+        animFrames[elId] = requestAnimationFrame(tick);
+    }
+
+    // --- Flash card ---
+    function flashCard(cardId) {
+        const card = document.getElementById(cardId);
+        if (!card) return;
+        card.classList.remove('flash');
+        // Force reflow to restart animation
+        void card.offsetWidth;
+        card.classList.add('flash');
+        card.addEventListener('animationend', () => card.classList.remove('flash'), { once: true });
+    }
+
+    // --- Check value change and animate ---
+    function animateValue(elId, cardId, newVal, decimals, prefix) {
+        prefix = prefix || '';
+        const fmtFn = (v) => prefix + fmt(v, decimals);
+        const oldVal = prevValues[elId];
+
+        if (oldVal !== undefined && oldVal !== newVal && newVal != null) {
+            countUp(elId, oldVal, newVal, 600, fmtFn);
+            flashCard(cardId);
+        } else if (newVal != null) {
+            document.getElementById(elId).textContent = fmtFn(newVal);
+        }
+        prevValues[elId] = newVal;
+    }
+
+    // --- Toast notification ---
+    function showToast(trade) {
+        const container = document.getElementById('toast-container');
+        const isBuy = trade.side === 'BUY';
+        const icon = isBuy ? '▲' : '▼';
+        const color = isBuy ? '#00e396' : '#ff4560';
+        const pnlText = trade.pnl_usd && trade.pnl_usd !== ''
+            ? ` | P&L: $${fmt(parseFloat(trade.pnl_usd))}`
+            : '';
+
+        const toast = document.createElement('div');
+        toast.className = 'toast-in flex items-center gap-3 px-4 py-3 rounded-xl text-sm shadow-lg';
+        toast.style.cssText = `background: #1e2433; border: 1px solid ${color}40; min-width: 260px;`;
+        toast.innerHTML = `
+            <span style="color:${color}; font-size:1.1em; font-weight:bold;">${icon}</span>
+            <div>
+                <div class="text-white font-medium">${trade.side} @ $${fmt(parseFloat(trade.price))}</div>
+                <div class="text-xs text-gray-400">${fmt(parseFloat(trade.qty), 6)} BTC${pnlText}</div>
+            </div>
+        `;
+        container.appendChild(toast);
+
+        setTimeout(() => {
+            toast.classList.remove('toast-in');
+            toast.classList.add('toast-out');
+            toast.addEventListener('animationend', () => toast.remove());
+        }, 5000);
+    }
+
+    // --- Relative time helper ---
+    function relativeTime(ms) {
+        const sec = Math.floor(ms / 1000);
+        if (sec < 60) return `${sec}s fa`;
+        const min = Math.floor(sec / 60);
+        if (min < 60) return `${min}m ${sec % 60}s fa`;
+        const hr = Math.floor(min / 60);
+        return `${hr}h ${min % 60}m fa`;
+    }
+
+    // --- Countdown timer (updates every second) ---
+    function updateCountdown() {
+        if (!lastTimestamp) return;
+        const section = document.getElementById('countdown-section');
+        section.style.display = 'block';
+
+        const elapsed = Date.now() - lastTimestamp;
+        const totalMs = sleepSeconds * 1000;
+        const remaining = Math.max(0, totalMs - elapsed);
+        const progress = Math.min((elapsed / totalMs) * 100, 100);
+
+        document.getElementById('relative-time').textContent = relativeTime(elapsed);
+
+        if (remaining > 0) {
+            const remSec = Math.floor(remaining / 1000);
+            const m = Math.floor(remSec / 60);
+            const s = remSec % 60;
+            document.getElementById('countdown-text').textContent = `${m}m ${s.toString().padStart(2, '0')}s`;
+        } else {
+            document.getElementById('countdown-text').textContent = 'imminente';
+        }
+
+        document.getElementById('countdown-bar').style.width = progress + '%';
+    }
+    setInterval(updateCountdown, 1000);
+
+    // --- Aggiorna Status ---
+    async function updateStatus() {
+        try {
+            const res = await fetch('/api/status');
+            if (!res.ok) {
+                document.getElementById('bot-status').innerHTML =
+                    '<span class="w-2 h-2 rounded-full bg-gray-500"></span><span>Bot offline</span>';
+                return;
+            }
+            const d = await res.json();
+            lastStatusData = d;
+
+            // Timestamp & countdown state
+            const ts = new Date(d.timestamp);
+            lastTimestamp = ts.getTime();
+            sleepSeconds = d.sleep_seconds || 900;
+
+            const age = Math.floor((Date.now() - ts.getTime()) / 1000);
+
+            document.getElementById('bot-status').innerHTML =
+                `<span class="w-2 h-2 rounded-full ${age < d.sleep_seconds * 2 ? 'bg-[#00e396] pulse' : 'bg-[#feb019]'}"></span>` +
+                `<span>${age < d.sleep_seconds * 2 ? 'Online' : 'Stale'}</span>`;
+
+            // Cards with count-up animation
+            animateValue('price', 'card-price', d.price, 2, '$');
+            animateValue('usdt', 'card-usdt', d.usdt, 2, '$');
+            animateValue('btc', 'card-btc', d.btc, 6, '');
+
+            // Signal
+            const sigEl = document.getElementById('signal');
+            const oldSignal = sigEl.textContent;
+            sigEl.textContent = d.signal;
+            sigEl.className = 'text-xl font-bold ' + (
+                d.signal === 'BUY' ? 'text-[#00e396]' :
+                d.signal.includes('SELL') ? 'text-[#ff4560]' : 'text-gray-400'
+            );
+            if (oldSignal !== '—' && oldSignal !== d.signal) flashCard('card-signal');
+
+            // Confidence with count-up
+            const pct = d.buy_proba * 100;
+            const oldPct = prevValues['confidence'];
+            if (oldPct !== undefined && oldPct !== pct) {
+                countUp('confidence', oldPct, pct, 600, (v) => v.toFixed(0) + '%');
+                flashCard('card-confidence');
+            } else {
+                document.getElementById('confidence').textContent = pct.toFixed(0) + '%';
+            }
+            prevValues['confidence'] = pct;
+
+            document.getElementById('confidence-bar').style.width = pct + '%';
+            const barColor = pct >= 60 ? '#00e396' : pct >= 40 ? '#feb019' : '#ff4560';
+            document.getElementById('confidence-bar').style.backgroundColor = barColor;
+
+            // Position
+            const banner = document.getElementById('position-banner');
+            const pnlCard = document.getElementById('pnl-card');
+            if (d.entry_price) {
+                banner.style.display = 'block';
+                pnlCard.style.display = 'block';
+                document.getElementById('entry-price').textContent = fmt(d.entry_price);
+                document.getElementById('entry-qty').textContent = fmt(d.entry_qty, 6);
+
+                const pnlPct = d.pnl_pct;
+                const pnlUsd = d.pnl_usd;
+                const pnlColor = pnlUsd >= 0 ? 'text-[#00e396]' : 'text-[#ff4560]';
+
+                document.getElementById('pnl').className = 'text-xl font-bold ' + pnlColor;
+                document.getElementById('pnl').textContent = fmtPct(pnlPct);
+                document.getElementById('pnl-usd').textContent = '$' + fmt(pnlUsd);
+
+                document.getElementById('pos-pnl-pct').className = 'text-lg font-bold ' + pnlColor;
+                document.getElementById('pos-pnl-pct').textContent = fmtPct(pnlPct);
+                document.getElementById('pos-pnl-usd').textContent = '$' + fmt(pnlUsd);
+
+                banner.className = 'card p-4 mb-6 ' + (pnlUsd >= 0 ? 'glow-green' : 'glow-red');
+            } else {
+                banner.style.display = 'none';
+                pnlCard.style.display = 'none';
+            }
+
+            // Sparkline
+            if (d.sparkline && d.sparkline.length > 1) updateSparkline(d.sparkline);
+
+            // Features radar
+            if (d.features) updateFeaturesChart(d.features);
+
+            // --- Signal Details Panel ---
+            // Decision panel
+            const lastLog = d.signal_log && d.signal_log.length > 0
+                ? d.signal_log[d.signal_log.length - 1] : null;
+            if (lastLog) {
+                const actEl = document.getElementById('dec-action');
+                const actionColors = {
+                    'HOLD': 'text-gray-400', 'BUY_BLOCKED': 'text-[#feb019]',
+                    'SHORT_BLOCKED': 'text-[#feb019]', 'OPEN_LONG': 'text-[#00e396]',
+                    'OPEN_SHORT': 'text-[#ff4560]', 'CLOSE_LONG': 'text-[#ff4560]',
+                    'CLOSE_SHORT': 'text-[#00e396]', 'STOP_LOSS_LONG': 'text-[#ff4560]',
+                    'STOP_LOSS_SHORT': 'text-[#ff4560]',
+                };
+                actEl.textContent = lastLog.action;
+                actEl.className = 'text-sm font-bold ' + (actionColors[lastLog.action] || 'text-white');
+                document.getElementById('dec-reason').textContent = lastLog.reason || '—';
+
+                const trendEl = document.getElementById('dec-trend');
+                trendEl.textContent = lastLog.trend === 'UP' ? '▲ Uptrend' : '▼ Downtrend';
+                trendEl.className = 'text-xs font-medium ' +
+                    (lastLog.trend === 'UP' ? 'text-[#00e396]' : 'text-[#ff4560]');
+
+                const posEl = document.getElementById('dec-pos');
+                if (lastLog.pos === 'FLAT') {
+                    posEl.textContent = '— Nessuna';
+                    posEl.className = 'text-xs font-medium text-gray-400';
+                } else {
+                    posEl.textContent = lastLog.pos === 'LONG' ? '🟢 LONG' : '🔴 SHORT';
+                    posEl.className = 'text-xs font-medium ' +
+                        (lastLog.pos === 'LONG' ? 'text-[#00e396]' : 'text-[#ff4560]');
+                }
+            }
+
+            // Dual model bars
+            const buyPct = d.buy_proba * 100;
+            const shortPct = (d.short_proba || 0) * 100;
+            document.getElementById('ml-buy-pct').textContent = buyPct.toFixed(0) + '%';
+            document.getElementById('ml-buy-bar').style.width = buyPct + '%';
+            document.getElementById('ml-buy-bar').style.backgroundColor =
+                buyPct >= (d.min_proba || 0.55) * 100 ? '#00e396' : '#374151';
+            document.getElementById('ml-short-pct').textContent = shortPct.toFixed(0) + '%';
+            document.getElementById('ml-short-bar').style.width = shortPct + '%';
+            document.getElementById('ml-short-bar').style.backgroundColor =
+                shortPct >= (d.short_min_proba || 0.60) * 100 ? '#ff4560' : '#374151';
+            if (d.min_proba) document.getElementById('ml-buy-thresh').textContent = (d.min_proba * 100).toFixed(0) + '%';
+            if (d.short_min_proba) document.getElementById('ml-short-thresh').textContent = (d.short_min_proba * 100).toFixed(0) + '%';
+
+            // Signal log (scrollable list)
+            if (d.signal_log && d.signal_log.length > 0) {
+                const logEl = document.getElementById('signal-log');
+                const logHtml = d.signal_log.slice().reverse().map(s => {
+                    const actColor = s.action.includes('LONG') || s.action === 'OPEN_LONG' ? '#00e396' :
+                                     s.action.includes('SHORT') || s.action === 'OPEN_SHORT' ? '#ff4560' :
+                                     s.action.includes('BLOCKED') ? '#feb019' :
+                                     s.action.includes('STOP') ? '#ff4560' : '#6b7280';
+                    const trendIcon = s.trend === 'UP' ? '<span class="text-[#00e396]">▲</span>' :
+                                      '<span class="text-[#ff4560]">▼</span>';
+                    return `<div class="flex items-center gap-2 p-1.5 rounded bg-gray-800/40 hover:bg-gray-800/70">
+                        <span class="text-gray-500 w-14 shrink-0">${s.ts}</span>
+                        ${trendIcon}
+                        <span class="text-gray-300">$${s.price.toLocaleString()}</span>
+                        <span style="color:${actColor}" class="font-medium shrink-0">${s.action}</span>
+                        <span class="text-gray-500 truncate ml-auto" title="${s.reason}">${s.reason}</span>
+                    </div>`;
+                }).join('');
+                logEl.innerHTML = logHtml;
+            }
+
+        } catch (e) {
+            console.error('Status update error:', e);
+        }
+    }
+
+    // --- Sparkline (mini price chart in BTC card) ---
+    function updateSparkline(prices) {
+        const ctx = document.getElementById('sparkline');
+        if (!ctx) return;
+
+        const labels = prices.map((_, i) => i);
+        const color = prices[prices.length - 1] >= prices[0] ? '#00e396' : '#ff4560';
+
+        if (sparklineChart) {
+            sparklineChart.data.labels = labels;
+            sparklineChart.data.datasets[0].data = prices;
+            sparklineChart.data.datasets[0].borderColor = color;
+            sparklineChart.data.datasets[0].backgroundColor = color + '15';
+            sparklineChart.update('none');
+        } else {
+            sparklineChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        data: prices,
+                        borderColor: color,
+                        backgroundColor: color + '15',
+                        fill: true,
+                        tension: 0.4,
+                        pointRadius: 0,
+                        borderWidth: 1.5,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false }, tooltip: { enabled: false } },
+                    scales: {
+                        x: { display: false },
+                        y: { display: false }
+                    },
+                    interaction: { enabled: false },
+                }
+            });
+        }
+    }
+
+    // --- Aggiorna Trades + Activity Feed + Toasts ---
+    async function updateTrades() {
+        try {
+            const res = await fetch('/api/trades');
+            const trades = await res.json();
+            const tbody = document.getElementById('trades-body');
+
+            // --- Toast for new trades ---
+            if (prevTradeCount === null) {
+                // First load: no toasts
+                prevTradeCount = trades.length;
+            } else if (trades.length > prevTradeCount) {
+                // Show toast for each new trade
+                const newCount = trades.length - prevTradeCount;
+                for (let i = 0; i < Math.min(newCount, 3); i++) {
+                    showToast(trades[i]);
+                }
+                prevTradeCount = trades.length;
+            }
+
+            // --- Activity Feed ---
+            const feed = document.getElementById('activity-feed');
+            const feedItems = [];
+
+            // Current signal as top item
+            if (lastStatusData) {
+                const d = lastStatusData;
+                const sigIcon = d.signal === 'BUY' ? '🟢' :
+                                d.signal.includes('SELL') ? '🔴' : '⚪';
+                const confStr = (d.buy_proba * 100).toFixed(0);
+                feedItems.push(`
+                    <div class="flex items-center gap-3 p-2.5 rounded-lg bg-[#008ffb]/5 border border-[#008ffb]/10 text-sm">
+                        <span>${sigIcon}</span>
+                        <span class="text-gray-300">Segnale corrente: <span class="text-white font-medium">${d.signal}</span></span>
+                        <span class="text-gray-500 text-xs">(${confStr}%)</span>
+                        <span class="text-xs text-gray-500 ml-auto">$${fmt(d.price)}</span>
+                    </div>
+                `);
+            }
+
+            // Recent trades as feed items
+            trades.slice(0, 10).forEach(t => {
+                const isBuy = t.side === 'BUY';
+                const icon = isBuy ? '<span class="text-[#00e396] font-bold">▲</span>' :
+                                     '<span class="text-[#ff4560] font-bold">▼</span>';
+                const sideColor = isBuy ? 'text-[#00e396]' : 'text-[#ff4560]';
+                const pnl = t.pnl_usd && t.pnl_usd !== '' ? parseFloat(t.pnl_usd) : null;
+                const pnlStr = pnl !== null
+                    ? `<span class="${pnl >= 0 ? 'text-[#00e396]' : 'text-[#ff4560]'}">$${fmt(pnl)}</span>`
+                    : '';
+                const ts = t.timestamp ? t.timestamp.substring(5, 16) : '';
+
+                feedItems.push(`
+                    <div class="flex items-center gap-3 p-2 rounded-lg bg-gray-800/30 text-sm">
+                        ${icon}
+                        <span class="${sideColor} font-medium w-16">${t.side}</span>
+                        <span class="text-gray-400">${fmt(parseFloat(t.qty), 6)} BTC @ $${fmt(parseFloat(t.price))}</span>
+                        ${pnlStr ? `<span class="text-xs">${pnlStr}</span>` : ''}
+                        <span class="text-xs text-gray-500 ml-auto">${ts}</span>
+                    </div>
+                `);
+            });
+
+            if (feedItems.length > 0) {
+                feed.innerHTML = feedItems.join('');
+            } else {
+                feed.innerHTML = '<div class="text-sm text-gray-500 py-2 text-center">Nessuna attivita\'</div>';
+            }
+
+            // --- Trades Table ---
+            if (!trades.length) {
+                tbody.innerHTML = '<tr><td colspan="6" class="py-4 text-center text-gray-500">Nessun trade</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = trades.slice(0, 20).map(t => {
+                const isBuy = t.side === 'BUY';
+                const sideColor = isBuy ? 'text-[#00e396]' : 'text-[#ff4560]';
+                const pnl = t.pnl_usd && t.pnl_usd !== '' ? parseFloat(t.pnl_usd) : null;
+                const pnlColor = pnl === null ? '' : pnl >= 0 ? 'text-[#00e396]' : 'text-[#ff4560]';
+                return `<tr class="border-b border-gray-800 hover:bg-gray-800/50">
+                    <td class="py-2 text-xs">${t.timestamp || '—'}</td>
+                    <td class="py-2 font-medium ${sideColor}">${t.side}</td>
+                    <td class="py-2 text-right">${fmt(t.qty, 6)}</td>
+                    <td class="py-2 text-right">$${fmt(t.price)}</td>
+                    <td class="py-2 text-right">${t.confidence ? (parseFloat(t.confidence)*100).toFixed(0)+'%' : '—'}</td>
+                    <td class="py-2 text-right ${pnlColor}">${pnl !== null ? '$'+fmt(pnl) : '—'}</td>
+                </tr>`;
+            }).join('');
+        } catch (e) {
+            console.error('Trades update error:', e);
+        }
+    }
+
+    // --- Equity Chart ---
+    async function updateEquityChart() {
+        try {
+            const res = await fetch('/api/equity');
+            const data = await res.json();
+
+            const labels = data.map(d => d.timestamp ? d.timestamp.substring(5, 16) : 'Start');
+            const values = data.map(d => d.equity);
+
+            if (equityChart) {
+                equityChart.data.labels = labels;
+                equityChart.data.datasets[0].data = values;
+                equityChart.update('none');
+            } else {
+                const ctx = document.getElementById('equity-chart').getContext('2d');
+                equityChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: labels,
+                        datasets: [{
+                            label: 'Equity ($)',
+                            data: values,
+                            borderColor: '#008ffb',
+                            backgroundColor: 'rgba(0, 143, 251, 0.1)',
+                            fill: true,
+                            tension: 0.3,
+                            pointRadius: 3,
+                            pointBackgroundColor: '#008ffb',
+                            borderWidth: 2,
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        plugins: { legend: { display: false } },
+                        scales: {
+                            x: { ticks: { color: '#6b7280', maxTicksLimit: 8 }, grid: { color: '#1e2433' } },
+                            y: { ticks: { color: '#6b7280', callback: v => '$' + v }, grid: { color: '#1e2433' } }
+                        }
+                    }
+                });
+            }
+        } catch (e) {
+            console.error('Equity chart error:', e);
+        }
+    }
+
+    // --- Features Radar ---
+    function updateFeaturesChart(features) {
+        const keys = ['rsi', 'macd', 'bb_width', 'stoch_k', 'rsi_slope', 'atr_ratio', 'vol_regime',
+                       'rsi_4h', 'trend_4h', 'trend_1d'];
+        const available = keys.filter(k => k in features);
+        const values = available.map(k => features[k]);
+
+        const maxAbs = Math.max(...values.map(Math.abs), 1);
+        const normalized = values.map(v => (v + maxAbs) / (2 * maxAbs));
+
+        if (featuresChart) {
+            featuresChart.data.labels = available;
+            featuresChart.data.datasets[0].data = normalized;
+            featuresChart.update('none');
+        } else {
+            const ctx = document.getElementById('features-chart').getContext('2d');
+            featuresChart = new Chart(ctx, {
+                type: 'radar',
+                data: {
+                    labels: available,
+                    datasets: [{
+                        label: 'Features',
+                        data: normalized,
+                        borderColor: '#008ffb',
+                        backgroundColor: 'rgba(0, 143, 251, 0.15)',
+                        pointBackgroundColor: '#008ffb',
+                        borderWidth: 2,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: {
+                        r: {
+                            grid: { color: '#1e2433' },
+                            angleLines: { color: '#1e2433' },
+                            ticks: { display: false },
+                            pointLabels: { color: '#9ca3af', font: { size: 10 } },
+                            suggestedMin: 0,
+                            suggestedMax: 1,
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // --- Candlestick Chart (Lightweight Charts) ---
+    async function updateCandlestickChart() {
+        try {
+            const res = await fetch('/api/candles');
+            const data = await res.json();
+
+            const placeholder = document.getElementById('candle-placeholder');
+
+            if (!data.length) {
+                if (placeholder) placeholder.textContent = 'Dati candele non disponibili';
+                return;
+            }
+            if (placeholder) placeholder.style.display = 'none';
+
+            // Transform data for Lightweight Charts
+            const candles = data.map(d => ({
+                time: Math.floor(new Date(d.timestamp).getTime() / 1000),
+                open: d.open,
+                high: d.high,
+                low: d.low,
+                close: d.close,
+            }));
+            const volumes = data.map(d => ({
+                time: Math.floor(new Date(d.timestamp).getTime() / 1000),
+                value: d.volume,
+                color: d.close >= d.open ? 'rgba(0, 227, 150, 0.3)' : 'rgba(255, 69, 96, 0.3)',
+            }));
+
+            if (!candleChart) {
+                const container = document.getElementById('candlestick-container');
+                candleChart = LightweightCharts.createChart(container, {
+                    layout: {
+                        background: { color: '#161b22' },
+                        textColor: '#9ca3af',
+                    },
+                    grid: {
+                        vertLines: { color: '#1e2433' },
+                        horzLines: { color: '#1e2433' },
+                    },
+                    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+                    timeScale: {
+                        borderColor: '#30363d',
+                        timeVisible: true,
+                        secondsVisible: false,
+                    },
+                    rightPriceScale: { borderColor: '#30363d' },
+                });
+
+                candleSeries = candleChart.addCandlestickSeries({
+                    upColor: '#00e396',
+                    downColor: '#ff4560',
+                    borderDownColor: '#ff4560',
+                    borderUpColor: '#00e396',
+                    wickDownColor: '#ff4560',
+                    wickUpColor: '#00e396',
+                });
+
+                volumeSeries = candleChart.addHistogramSeries({
+                    priceFormat: { type: 'volume' },
+                    priceScaleId: 'volume',
+                });
+                candleChart.priceScale('volume').applyOptions({
+                    scaleMargins: { top: 0.8, bottom: 0 },
+                });
+
+                // Responsive resize
+                const ro = new ResizeObserver(() => {
+                    candleChart.applyOptions({
+                        width: container.clientWidth,
+                        height: container.clientHeight,
+                    });
+                });
+                ro.observe(container);
+            }
+
+            candleSeries.setData(candles);
+            volumeSeries.setData(volumes);
+
+        } catch (e) {
+            console.error('Candlestick chart error:', e);
+        }
+    }
+
+    // --- Init & Auto-refresh ---
+    async function refresh() {
+        await Promise.all([
+            updateStatus(),
+            updateTrades(),
+            updateEquityChart(),
+            updateCandlestickChart(),
+        ]);
+    }
+    refresh();
+    setInterval(refresh, 30000);
+</script>
+</body>
+</html>
