@@ -92,6 +92,8 @@ TRADE_SIZE      = 0.95        # % del capitale per ogni ordine
 STOP_LOSS       = 0.02        # 2% stop loss
 INITIAL_CASH    = 500         # capitale backtest (USD)
 SLEEP_SECONDS   = 900         # pausa tra cicli del bot (15 min)
+MAX_RETRIES     = 3           # tentativi per errori di rete transitori
+RETRY_BACKOFF   = [30, 60, 120]  # secondi di attesa tra retry
 MIN_HOLD_BARS   = 5           # hold minimo 5h prima di SELL tecnico (stop loss escluso)
 LOG_FILE        = "trades_log.csv"
 RETRAIN_HOURS   = 24          # riaddestra ogni N ore
@@ -192,6 +194,11 @@ salva snapshot su dashboard_data.json
 se ore_dall_ultimo_training >= RETRAIN_HOURS:
     scarica dati freschi, riallena modello, salva su disco
 
+# Retry errori di rete
+se ccxt.NetworkError → riprova fino a 3 volte (30s, 60s, 120s backoff)
+se tutti i retry falliscono → notifica Telegram
+se errore non di rete → notifica Telegram immediata
+
 # Notifiche Telegram
 BUY/SELL/STOP_LOSS/ERRORE → messaggio immediato
 STATUS → 1 volta al giorno (STATUS_INTERVAL = 86400)
@@ -290,3 +297,5 @@ Dashboard web (Flask + Tailwind CSS + Chart.js + Lightweight Charts) con:
 - Optuna best_params.json ha TTL 48h; cancellare per forzare ri-ottimizzazione.
 - Fold degeneri usano il modello del fold precedente come fallback.
 - `save_dashboard_data()` e' wrappato in try/except per non bloccare stop-loss in caso di errore I/O.
+- Errori di rete ccxt vengono ritentati fino a 3 volte con backoff (30s, 60s, 120s) prima di notificare Telegram.
+- `entry_price`/`save_state()` vengono salvati subito dopo `create_order()`, prima di Telegram/dashboard.

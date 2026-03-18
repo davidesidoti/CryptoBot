@@ -106,6 +106,8 @@ Tutte le variabili sono nel blocco CONFIG in cima a `cryptobot.py`:
 | `INITIAL_CASH` | `500` | Capitale iniziale per il backtest (USD) |
 | `RETRAIN_HOURS` | `24` | Riaddestra il modello ogni N ore |
 | `SLEEP_SECONDS` | `900` | Pausa tra i cicli del bot (15 min) |
+| `MAX_RETRIES` | `3` | Tentativi per errori di rete transitori |
+| `RETRY_BACKOFF` | `[30, 60, 120]` | Secondi di attesa tra retry |
 | `OPTUNA_TRIALS` | `50` | Trial per ottimizzazione bayesiana |
 
 ## Feature del modello (23 totali)
@@ -143,6 +145,7 @@ Il modello usa feature su tre timeframe:
 - [x] Retraining automatico ogni 24h
 - [x] Persistenza modello su disco (joblib)
 - [x] Persistenza stato posizione + entry_time (bot_state.json)
+- [x] Retry con backoff per errori di rete (3 tentativi, 30/60/120s)
 - [x] Notifiche Telegram (trade, stop loss, errori, retraining, status giornaliero)
 - [x] Logging trade su CSV
 - [x] Dashboard web (Flask + Chart.js + Tailwind, porta 5050)

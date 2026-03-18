@@ -65,6 +65,10 @@ The model is binary: BUY (1) vs NO-BUY (0). `predict_proba` for BUY must exceed 
 - **Dashboard**: `dashboard.py` (Flask on port 5050) reads `dashboard_data.json` and `price_history.json` written by bot each cycle. Run as separate process. Endpoints: `/api/status`, `/api/trades`, `/api/equity`, `/api/candles`.
 - **Degenerate folds**: now use previous fold's model as fallback instead of zeroing predictions.
 - **`save_state()` entry_time**: old state files without `entry_time` are handled gracefully (sell not blocked).
+- **Retry con backoff**: errori di rete transitori (`ccxt.NetworkError`) vengono ritentati fino a 3 volte
+  (30s, 60s, 120s) prima di notificare su Telegram. Errori non di rete notificano subito.
+- **State persistence after order**: `entry_price`/`save_state()` vengono chiamati subito dopo
+  `create_order()`, prima di Telegram/dashboard, per evitare posizioni "fantasma" in caso di errore.
 
 ## Features used by the model (23 total)
 
