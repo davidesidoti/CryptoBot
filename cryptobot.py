@@ -99,7 +99,9 @@ def fetch_ohlcv(symbol=SYMBOL, timeframe=TIMEFRAME, limit=FETCH_LIMIT):
     Scarica i dati OHLCV da Binance (endpoint pubblico, niente API key).
     Supporta paginazione per ottenere piu' di 1000 candele.
     """
-    exchange = ccxt.binance()
+    exchange = ccxt.binance({
+        "options": {"fetchMarkets": {"types": ["spot"]}},
+    })
     max_per_request = 1000
 
     if limit <= max_per_request:
@@ -689,9 +691,11 @@ def get_testnet_exchange():
         "secret": TESTNET_SECRET,
         "options": {
             "defaultType": "spot",
+            "fetchMarkets": {"types": ["spot"]},
         },
     })
     exchange.enable_demo_trading(True)
+    exchange.load_markets()
     return exchange
 
 
@@ -1160,4 +1164,4 @@ if __name__ == "__main__":
         backtest(df_raw, df_feat, model, pred_series=wf_predictions)
 
     # Decommenta la riga sotto per avviare il bot live sul testnet
-    run_bot(model)
+    #run_bot(model)
