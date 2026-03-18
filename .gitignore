@@ -219,3 +219,7 @@ bot_state.json
 dashboard_data.json
 best_params.json
 price_history.json
+best_params_buy.json
+best_params_short.json
+model_buy.joblib
+model_short.joblib

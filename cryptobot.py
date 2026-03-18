@@ -69,6 +69,17 @@ STATE_FILE      = "bot_state.json"
 DASHBOARD_FILE  = "dashboard_data.json"
 PRICE_HISTORY_FILE = "price_history.json"
 
+# SHORT parameters
+SHORT_STOP_LOSS    = 0.02    # 2% stop loss per SHORT
+SHORT_MIN_PROBA    = 0.60    # soglia piu' alta (SHORT piu' selettivo)
+SHORT_TRADE_SIZE   = 0.70    # 70% capitale (meno aggressivo del LONG 95%)
+SHORT_MIN_HOLD     = 3       # hold minimo 3h (bear moves piu' veloci)
+ENABLE_SHORT       = True    # flag per abilitare/disabilitare SHORT
+
+# Model files (dual model)
+MODEL_BUY_FILE     = "model_buy.joblib"
+MODEL_SHORT_FILE   = "model_short.joblib"
+
 TRANSIENT_ERRORS = (
     ccxt.NetworkError,      # copre ExchangeNotAvailable, RequestTimeout, DDoSProtection
 )
@@ -83,7 +94,9 @@ FEATURES = [
     "rsi_4h", "macd_4h", "ema_cross_4h", "trend_4h",
     "rsi_1d", "adx_1d",
     # Regime / volatilita'
-    "atr_ratio", "vol_regime"
+    "atr_ratio", "vol_regime",
+    # SHORT-specific
+    "trend_down", "macd_hist"
 ]
 
 # Walk-forward validation
@@ -229,6 +242,10 @@ def build_features(df):
     vol_20 = df["volume"].rolling(20).mean()
     df["vol_regime"] = df["volume"] / vol_20  # >1 = volume sopra media
 
+    # === SHORT-specific features ===
+    df["trend_down"] = (df["close"] < df["ema_20"]).astype(int)  # inverso di trend_up
+    df["macd_hist"]  = df["macd"] - df["macd_signal"]            # MACD histogram esplicito
+
     # === Target dinamico (soglia basata su ATR) ===
     # Usa ATR% come soglia: se mercato volatile, servono movimenti piu' grandi
     atr_pct = df["atr"] / df["close"]
@@ -248,25 +265,27 @@ def build_features(df):
 # 3. TRAINING MODELLO
 # ─────────────────────────────────────────────
 
-def train_model(df):
+def train_model(df, target_label=1):
     """
-    Allena un XGBoost binary classifier: BUY (1) vs NO-BUY (0).
-    Il segnale SELL viene gestito da regole tecniche, non dal classificatore.
+    Allena un XGBoost binary classifier.
+    target_label=1 per BUY vs NO-BUY, target_label=-1 per SHORT vs NO-SHORT.
     Usa shuffle=False perche' i dati sono time-series.
     """
+    label_name = "BUY" if target_label == 1 else "SHORT"
+    neg_name = "NO-BUY" if target_label == 1 else "NO-SHORT"
+
     X = df[FEATURES]
-    # Binary: 1 = BUY, 0 = tutto il resto (HOLD + SELL)
-    y = (df["label"] == 1).astype(int)
+    y = (df["label"] == target_label).astype(int)
 
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, shuffle=False
     )
 
     # Diagnostica distribuzione classi
-    print("Distribuzione classi (train):")
+    print(f"Distribuzione classi {label_name} (train):")
     for cls in [0, 1]:
         count = (y_train == cls).sum()
-        name = "BUY" if cls == 1 else "NO-BUY"
+        name = label_name if cls == 1 else neg_name
         print(f"  {name}: {count} ({count/len(y_train):.1%})")
 
     # scale_pos_weight: bilancia automaticamente la classe rara
@@ -294,10 +313,10 @@ def train_model(df):
         verbose=False
     )
 
-    print(f"\nMiglior iterazione: {model.best_iteration} / 500")
-    print("\n=== Valutazione modello sul test set ===")
+    print(f"\nMiglior iterazione ({label_name}): {model.best_iteration} / 500")
+    print(f"\n=== Valutazione modello {label_name} sul test set ===")
     preds = model.predict(X_test)
-    print(classification_report(y_test, preds, target_names=["NO-BUY", "BUY"]))
+    print(classification_report(y_test, preds, target_names=[neg_name, label_name]))
 
     return model
 
@@ -306,28 +325,35 @@ def train_model(df):
 # 3b. OTTIMIZZAZIONE IPERPARAMETRI (OPTUNA)
 # ─────────────────────────────────────────────
 
-OPTUNA_FILE = "best_params.json"
-OPTUNA_TRIALS = 50  # numero di trial per la ricerca
+OPTUNA_BUY_FILE   = "best_params_buy.json"
+OPTUNA_SHORT_FILE = "best_params_short.json"
+OPTUNA_TRIALS     = 50  # numero di trial per la ricerca
 
 
-def optimize_hyperparams(df, n_trials=OPTUNA_TRIALS):
+def optimize_hyperparams(df, target_label=1, cache_file=None, n_trials=OPTUNA_TRIALS):
     """
     Usa Optuna per trovare i migliori iperparametri XGBoost.
     Valida su un split temporale (ultimi 20% del dataset).
-    Salva i risultati su best_params.json per riutilizzo.
+    target_label: 1 per BUY, -1 per SHORT.
+    cache_file: file JSON per caching (default: OPTUNA_BUY_FILE o OPTUNA_SHORT_FILE).
     """
+    if cache_file is None:
+        cache_file = OPTUNA_BUY_FILE if target_label == 1 else OPTUNA_SHORT_FILE
+
+    label_name = "BUY" if target_label == 1 else "SHORT"
+
     # Se esiste un file recente (< 48h), riusa i parametri
-    if os.path.isfile(OPTUNA_FILE):
-        age_h = (time.time() - os.path.getmtime(OPTUNA_FILE)) / 3600
+    if os.path.isfile(cache_file):
+        age_h = (time.time() - os.path.getmtime(cache_file)) / 3600
         if age_h < 48:
-            with open(OPTUNA_FILE) as f:
+            with open(cache_file) as f:
                 params = json.load(f)
-            print(f"Iperparametri caricati da {OPTUNA_FILE} (eta': {age_h:.1f}h)")
+            print(f"Iperparametri {label_name} caricati da {cache_file} (eta': {age_h:.1f}h)")
             return params
 
-    print(f"\n=== Ottimizzazione iperparametri ({n_trials} trial) ===")
+    print(f"\n=== Ottimizzazione iperparametri {label_name} ({n_trials} trial) ===")
     X = df[FEATURES]
-    y = (df["label"] == 1).astype(int)
+    y = (df["label"] == target_label).astype(int)
 
     # Split temporale: train 70%, val 15%, test 15% (test non usato qui)
     split_1 = int(len(X) * 0.70)
@@ -338,6 +364,7 @@ def optimize_hyperparams(df, n_trials=OPTUNA_TRIALS):
     neg = (y_train == 0).sum()
     pos = (y_train == 1).sum()
     spw = min(neg / pos, 50.0) if pos > 0 else 1.0
+    print(f"  Samples positivi ({label_name}): {pos}, negativi: {neg}, scale_pos_weight: {spw:.1f}")
 
     def objective(trial):
         params = {
@@ -357,7 +384,6 @@ def optimize_hyperparams(df, n_trials=OPTUNA_TRIALS):
         m = XGBClassifier(**params)
         m.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
 
-        # Obiettivo: massimizzare F1 della classe BUY
         preds = m.predict(X_val)
         from sklearn.metrics import f1_score
         return f1_score(y_val, preds, pos_label=1, zero_division=0)
@@ -366,14 +392,14 @@ def optimize_hyperparams(df, n_trials=OPTUNA_TRIALS):
     study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
 
     best = study.best_params
-    print(f"Migliori parametri trovati (F1 BUY: {study.best_value:.3f}):")
+    print(f"Migliori parametri {label_name} (F1: {study.best_value:.3f}):")
     for k, v in best.items():
         print(f"  {k}: {v}")
 
     # Salva su disco
-    with open(OPTUNA_FILE, "w") as f:
+    with open(cache_file, "w") as f:
         json.dump(best, f, indent=2)
-    print(f"Salvati in {OPTUNA_FILE}")
+    print(f"Salvati in {cache_file}")
 
     return best
 
@@ -405,38 +431,122 @@ def technical_sell_signal(df):
     return sell
 
 
-def walk_forward_train(df, best_params=None):
+def technical_cover_signal(df):
     """
-    Walk-forward validation con binary classification (BUY vs NO-BUY).
-    Il segnale SELL e' generato da regole tecniche, non dal modello ML.
+    Genera segnali di COPERTURA SHORT basati su regole tecniche (speculare a sell):
+    - RSI < 25 (ipervenduto) + rimbalzo (rsi_slope > 0)
+    - MACD cross rialzista confermato (gap in aumento per 2 barre consecutive)
+    - Prezzo risale sopra EMA20 con momentum significativo (0.8%)
+    Ritorna una Series booleana con True dove c'e' segnale COVER (chiudi SHORT).
+    """
+    cover = pd.Series(False, index=df.index)
+
+    # RSI ipervenduto + inizio rimbalzo
+    cover |= (df["rsi"] < 25) & (df["rsi_slope"] > 0)
+
+    # MACD cross rialzista confermato (gap in aumento per 2 barre consecutive)
+    macd_gap = df["macd"] - df["macd_signal"]
+    cover |= (macd_gap > 0) & (macd_gap.diff() > 0) & (macd_gap.shift(1).diff() > 0)
+
+    # Prezzo risale sopra EMA20 con momentum significativo (0.8%)
+    cover |= (df["trend_up"] == 1) & (df["price_change"] > 0.008)
+
+    return cover
+
+
+def _train_single_model(X_train, y_train, X_test, y_test, hp, prev_model, min_samples=20):
+    """
+    Allena un singolo XGBClassifier con guard per fold degeneri.
+    Ritorna (model_or_fallback, preds, proba, is_degenerate, prev_model).
+    """
+    neg_count = (y_train == 0).sum()
+    pos_count = (y_train == 1).sum()
+    spw = min(neg_count / pos_count, 50.0) if pos_count > 0 else 1.0
+
+    mdl = XGBClassifier(
+        n_estimators=500,
+        max_depth=hp["max_depth"],
+        learning_rate=hp["learning_rate"],
+        min_child_weight=hp["min_child_weight"],
+        subsample=hp["subsample"],
+        colsample_bytree=hp["colsample_bytree"],
+        reg_alpha=hp["reg_alpha"],
+        reg_lambda=hp["reg_lambda"],
+        scale_pos_weight=spw,
+        eval_metric="logloss",
+        verbosity=0,
+        early_stopping_rounds=80
+    )
+    mdl.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+
+    is_degenerate = mdl.best_iteration < 10 or pos_count < min_samples
+    if is_degenerate and prev_model is not None:
+        preds = prev_model.predict(X_test)
+        proba = prev_model.predict_proba(X_test)[:, 1]
+    elif is_degenerate:
+        preds = np.zeros(len(X_test), dtype=int)
+        proba = np.full(len(X_test), 0.0)
+    else:
+        preds = mdl.predict(X_test)
+        proba = mdl.predict_proba(X_test)[:, 1]
+        prev_model = mdl
+
+    return mdl, preds, proba, is_degenerate, prev_model
+
+
+def walk_forward_train(df, best_params_buy=None, best_params_short=None):
+    """
+    Walk-forward validation con dual binary classification:
+    - model_buy:   BUY (1) vs NO-BUY (0)
+    - model_short: SHORT (1) vs NO-SHORT (0)
+    Il segnale CLOSE LONG viene da regole tecniche (technical_sell_signal).
+    Il segnale CLOSE SHORT viene da regole tecniche (technical_cover_signal).
     Per ogni finestra, genera predictions out-of-sample.
-    Ritorna il modello allenato sull'ultimo fold e le predictions aggregate.
-    Se best_params e' fornito (da Optuna), usa quelli al posto dei default.
+    Signal encoding: +1=OPEN LONG, -1=OPEN SHORT, -2=CLOSE LONG, +2=CLOSE SHORT, 0=HOLD.
+    Se ENABLE_SHORT=False, il model_short non viene trainato.
     """
     X = df[FEATURES]
-    # Binary target: 1 = BUY, 0 = NO-BUY
-    y = (df["label"] == 1).astype(int)
+    y_buy   = (df["label"] == 1).astype(int)
+    y_short = (df["label"] == -1).astype(int)
 
-    all_preds  = []
-    all_proba  = []
-    all_actual = []
+    # Risultati per fold (BUY)
+    all_buy_preds  = []
+    all_buy_proba  = []
+    all_buy_actual = []
+    # Risultati per fold (SHORT)
+    all_short_preds  = []
+    all_short_proba  = []
+    all_short_actual = []
     all_idx    = []
     n = len(df)
     fold = 0
-    prev_model = None  # fallback per fold degeneri
-    MIN_BUY_SAMPLES = 20  # minimo BUY nel training set
+    prev_buy_model = None
+    prev_short_model = None
+    MIN_SAMPLES = 20
 
-    # Iperparametri: usa Optuna se disponibili, altrimenti default
-    hp = {
+    # Iperparametri BUY: Optuna o default
+    hp_buy = {
         "max_depth": 4, "learning_rate": 0.03, "min_child_weight": 10,
         "subsample": 0.8, "colsample_bytree": 0.7,
         "reg_alpha": 0.3, "reg_lambda": 1.5,
     }
-    if best_params:
-        hp.update(best_params)
-        print(f"Usando iperparametri ottimizzati (Optuna)")
+    if best_params_buy:
+        hp_buy.update(best_params_buy)
+        print(f"Usando iperparametri BUY ottimizzati (Optuna)")
 
-    print(f"Walk-forward: train={WF_TRAIN_BARS}, test={WF_TEST_BARS}, "
+    # Iperparametri SHORT: Optuna o default
+    hp_short = {
+        "max_depth": 4, "learning_rate": 0.03, "min_child_weight": 10,
+        "subsample": 0.8, "colsample_bytree": 0.7,
+        "reg_alpha": 0.3, "reg_lambda": 1.5,
+    }
+    if best_params_short:
+        hp_short.update(best_params_short)
+        print(f"Usando iperparametri SHORT ottimizzati (Optuna)")
+
+    short_enabled = ENABLE_SHORT
+    mode_str = "LONG+SHORT" if short_enabled else "LONG-only"
+    print(f"Walk-forward ({mode_str}): train={WF_TRAIN_BARS}, test={WF_TEST_BARS}, "
           f"dataset={n} righe")
 
     i = 0
@@ -446,108 +556,140 @@ def walk_forward_train(df, best_params=None):
         test_end  = min(train_end + WF_TEST_BARS, n)
 
         X_train = X.iloc[i:train_end]
-        y_train = y.iloc[i:train_end]
         X_test  = X.iloc[train_end:test_end]
-        y_test  = y.iloc[train_end:test_end]
 
-        # scale_pos_weight per questo fold (con cap a 50 per evitare estremi)
-        neg_count = (y_train == 0).sum()
-        pos_count = (y_train == 1).sum()
-        spw = min(neg_count / pos_count, 50.0) if pos_count > 0 else 1.0
-
-        model = XGBClassifier(
-            n_estimators=500,
-            max_depth=hp["max_depth"],
-            learning_rate=hp["learning_rate"],
-            min_child_weight=hp["min_child_weight"],
-            subsample=hp["subsample"],
-            colsample_bytree=hp["colsample_bytree"],
-            reg_alpha=hp["reg_alpha"],
-            reg_lambda=hp["reg_lambda"],
-            scale_pos_weight=spw,
-            eval_metric="logloss",
-            verbosity=0,
-            early_stopping_rounds=80
-        )
-        model.fit(
-            X_train, y_train,
-            eval_set=[(X_test, y_test)],
-            verbose=False
+        # --- BUY model ---
+        y_buy_train = y_buy.iloc[i:train_end]
+        y_buy_test  = y_buy.iloc[train_end:test_end]
+        buy_mdl, buy_preds, buy_proba, buy_degen, prev_buy_model = _train_single_model(
+            X_train, y_buy_train, X_test, y_buy_test, hp_buy, prev_buy_model, MIN_SAMPLES
         )
 
-        # Guard per fold degeneri: usa modello precedente come fallback
-        is_degenerate = model.best_iteration < 10 or pos_count < MIN_BUY_SAMPLES
-        if is_degenerate and prev_model is not None:
-            # Riusa il modello del fold precedente (che era buono)
-            preds = prev_model.predict(X_test)
-            proba = prev_model.predict_proba(X_test)[:, 1]
-        elif is_degenerate:
-            preds = np.zeros(len(X_test), dtype=int)
-            proba = np.full(len(X_test), 0.0)
+        # --- SHORT model ---
+        if short_enabled:
+            y_short_train = y_short.iloc[i:train_end]
+            y_short_test  = y_short.iloc[train_end:test_end]
+            short_mdl, short_preds, short_proba, short_degen, prev_short_model = _train_single_model(
+                X_train, y_short_train, X_test, y_short_test, hp_short, prev_short_model, MIN_SAMPLES
+            )
         else:
-            preds = model.predict(X_test)
-            proba = model.predict_proba(X_test)[:, 1]  # probabilita' BUY
-            prev_model = model  # salva come fallback
+            short_preds = np.zeros(len(X_test), dtype=int)
+            short_proba = np.full(len(X_test), 0.0)
+            short_degen = True
 
-        all_preds.extend(preds)
-        all_proba.extend(proba)
-        all_actual.extend(y_test.values)
-        all_idx.extend(y_test.index)
+        all_buy_preds.extend(buy_preds)
+        all_buy_proba.extend(buy_proba)
+        all_buy_actual.extend(y_buy_test.values)
+        all_short_preds.extend(short_preds)
+        all_short_proba.extend(short_proba)
+        all_short_actual.extend(y_short.iloc[train_end:test_end].values)
+        all_idx.extend(y_buy_test.index)
 
-        buy_preds = sum(preds)
-        status = " [DEGENERATE - skipped]" if is_degenerate else ""
+        buy_cnt = sum(buy_preds)
+        short_cnt = sum(short_preds) if short_enabled else 0
+        buy_status = " [DEGEN]" if buy_degen else ""
+        short_status = " [DEGEN]" if short_degen else ""
         print(f"  Fold {fold}: train [{i}:{train_end}] | "
               f"test [{train_end}:{test_end}] | "
-              f"best_iter={model.best_iteration} | "
-              f"BUY pred: {buy_preds}/{len(preds)}{status}")
+              f"BUY: {buy_cnt}/{len(buy_preds)}{buy_status} | "
+              f"SHORT: {short_cnt}/{len(short_preds)}{short_status}")
 
-        i += WF_TEST_BARS  # scorrimento della finestra
+        i += WF_TEST_BARS
 
-    print(f"\n=== Walk-forward: {fold} fold completati ===")
-    print(f"Predictions out-of-sample totali: {len(all_preds)}")
-    print("\n=== Classification report (aggregato walk-forward) ===")
+    print(f"\n=== Walk-forward: {fold} fold completati ({mode_str}) ===")
+    print(f"Predictions out-of-sample totali: {len(all_buy_preds)}")
+
+    # Classification report BUY
+    print("\n=== Classification report BUY (aggregato) ===")
     print(classification_report(
-        all_actual, all_preds,
+        all_buy_actual, all_buy_preds,
         target_names=["NO-BUY", "BUY"]
     ))
 
+    # Classification report SHORT
+    if short_enabled:
+        print("=== Classification report SHORT (aggregato) ===")
+        print(classification_report(
+            all_short_actual, all_short_preds,
+            target_names=["NO-SHORT", "SHORT"]
+        ))
+
     # Analisi qualita' segnali BUY
-    preds_arr = np.array(all_preds)
-    actual_arr = np.array(all_actual)
-    if preds_arr.sum() > 0:
-        buy_precision = actual_arr[preds_arr == 1].mean()
+    buy_preds_arr = np.array(all_buy_preds)
+    buy_actual_arr = np.array(all_buy_actual)
+    if buy_preds_arr.sum() > 0:
+        buy_precision = buy_actual_arr[buy_preds_arr == 1].mean()
         print(f"BUY precision effettiva: {buy_precision:.1%} "
-              f"({preds_arr.sum()} segnali BUY predetti)")
+              f"({buy_preds_arr.sum()} segnali BUY predetti)")
 
-    # Genera segnali combinati per il backtest:
-    # ML predice BUY, regole tecniche generano SELL
-    sell_signals = technical_sell_signal(df)
+    # Analisi qualita' segnali SHORT
+    if short_enabled:
+        short_preds_arr = np.array(all_short_preds)
+        short_actual_arr = np.array(all_short_actual)
+        if short_preds_arr.sum() > 0:
+            short_precision = short_actual_arr[short_preds_arr == 1].mean()
+            print(f"SHORT precision effettiva: {short_precision:.1%} "
+                  f"({short_preds_arr.sum()} segnali SHORT predetti)")
 
-    # Crea la serie di predictions per il backtest
-    # +1 = BUY (dal modello ML), -1 = SELL (da regole tecniche), 0 = HOLD
-    pred_values = np.zeros(len(all_preds))
-    for j in range(len(all_preds)):
+    # === Genera segnali combinati per il backtest ===
+    # Signal encoding:
+    #   +1 = OPEN LONG   (ML BUY con alta confidenza)
+    #   -1 = OPEN SHORT  (ML SHORT con alta confidenza)
+    #   -2 = CLOSE LONG  (technical sell signal)
+    #   +2 = CLOSE SHORT (technical cover signal)
+    #    0 = HOLD
+    sell_signals  = technical_sell_signal(df)
+    cover_signals = technical_cover_signal(df)
+
+    pred_values = np.zeros(len(all_buy_preds))
+    n_conflicts = 0
+    for j in range(len(all_buy_preds)):
         idx = all_idx[j]
-        if all_preds[j] == 1 and all_proba[j] >= MIN_PROBA:
-            pred_values[j] = 1   # BUY (ML dice BUY con alta confidenza)
+        buy_ok   = all_buy_preds[j] == 1 and all_buy_proba[j] >= MIN_PROBA
+        short_ok = short_enabled and all_short_preds[j] == 1 and all_short_proba[j] >= SHORT_MIN_PROBA
+
+        if buy_ok and short_ok:
+            pred_values[j] = 0  # conflitto: entrambi i modelli "sparano" -> HOLD
+            n_conflicts += 1
+        elif buy_ok:
+            pred_values[j] = 1   # OPEN LONG
+        elif short_ok:
+            pred_values[j] = -1  # OPEN SHORT
         elif sell_signals.loc[idx]:
-            pred_values[j] = -1  # SELL (regole tecniche)
+            pred_values[j] = -2  # CLOSE LONG (technical)
+        elif short_enabled and cover_signals.loc[idx]:
+            pred_values[j] = 2   # CLOSE SHORT (technical)
         # else: 0 (HOLD)
 
     pred_series = pd.Series(pred_values.astype(int), index=all_idx)
 
-    return model, pred_series
+    # Stats dei segnali
+    n_open_long  = (pred_values == 1).sum()
+    n_open_short = (pred_values == -1).sum()
+    n_close_long = (pred_values == -2).sum()
+    n_close_short = (pred_values == 2).sum()
+    print(f"\nSegnali generati: OPEN_LONG={n_open_long}, OPEN_SHORT={n_open_short}, "
+          f"CLOSE_LONG={n_close_long}, CLOSE_SHORT={n_close_short}, "
+          f"HOLD={int((pred_values == 0).sum())}, CONFLITTI={n_conflicts}")
+
+    # Ritorna entrambi i modelli dell'ultimo fold valido
+    final_buy_model = prev_buy_model if prev_buy_model else buy_mdl
+    final_short_model = prev_short_model if (short_enabled and prev_short_model) else (short_mdl if short_enabled else None)
+
+    return final_buy_model, final_short_model, pred_series
 
 
 # ─────────────────────────────────────────────
 # 4. BACKTEST
 # ─────────────────────────────────────────────
 
-def backtest(df_raw, df_feat, model, pred_series=None, test_size=0.2):
+def backtest(df_raw, df_feat, model_buy, model_short=None, pred_series=None, test_size=0.2):
     """
     Backtesta la strategia ML solo sui dati out-of-sample (test set)
     per evitare data leakage. Include stop loss e report P&L in dollari.
     Se pred_series e' fornita (da walk-forward), usa quelle predictions.
+    Supporta LONG + SHORT con signal encoding:
+      +1=OPEN LONG, -1=OPEN SHORT, -2=CLOSE LONG, +2=CLOSE SHORT, 0=HOLD.
     """
 
     if pred_series is not None:
@@ -555,15 +697,15 @@ def backtest(df_raw, df_feat, model, pred_series=None, test_size=0.2):
         feat_index  = pred_series.index
         raw_aligned = df_raw.loc[feat_index].copy()
     else:
-        # Singolo split: genera predictions dal modello
+        # Singolo split: genera predictions dal modello (LONG-only fallback)
         split_idx   = int(len(df_feat) * (1 - test_size))
         df_test     = df_feat.iloc[split_idx:]
         feat_index  = df_test.index
         raw_aligned = df_raw.loc[feat_index].copy()
-        predictions = model.predict(df_test[FEATURES]) - 1
+        predictions = model_buy.predict(df_test[FEATURES]) - 1
         pred_series = pd.Series(predictions, index=feat_index)
 
-    # Filtro trend: blocca BUY quando prezzo < EMA20
+    # Filtro trend: blocca BUY quando prezzo < EMA20, blocca SHORT quando prezzo > EMA20
     trend_up = df_feat.loc[feat_index, "trend_up"]
 
     class MLStrategy(Strategy):
@@ -584,29 +726,53 @@ def backtest(df_raw, df_feat, model, pred_series=None, test_size=0.2):
             price = self.data.Close[-1]
             trend_ok = self.trend[-1] == 1
 
-            # Stop loss: chiudi long se la perdita supera STOP_LOSS (SEMPRE attivo)
+            # Stop loss LONG: chiudi se la perdita supera STOP_LOSS (SEMPRE attivo)
             if self.position.is_long and self.entry_price:
                 self.bars_held += 1
                 loss = (price - self.entry_price) / self.entry_price
                 if loss <= -STOP_LOSS:
                     self.position.close()
-                    self.entry_price = None
-                    self.bars_held = 0
+                    self._reset()
                     return
 
-            # BUY: entra long (solo se trend up e non gia' in posizione)
+            # Stop loss SHORT: chiudi se prezzo sale oltre SHORT_STOP_LOSS (SEMPRE attivo)
+            if self.position.is_short and self.entry_price:
+                self.bars_held += 1
+                loss = (self.entry_price - price) / self.entry_price  # invertito
+                if loss <= -SHORT_STOP_LOSS:
+                    self.position.close()
+                    self._reset()
+                    return
+
+            # OPEN LONG: sig == +1, flat, trend up
             if sig == 1 and not self.position and trend_ok:
                 self.buy(size=TRADE_SIZE)
                 self.entry_price = price
                 self.bars_held = 0
 
-            # SELL: chiudi long (solo se in posizione e hold minimo rispettato)
-            elif sig == -1 and self.position.is_long:
-                if self.bars_held < MIN_HOLD_BARS:
-                    return  # hold minimo non raggiunto, stop loss gia' controllato sopra
-                self.position.close()
-                self.entry_price = None
+            # OPEN SHORT: sig == -1, flat, trend down
+            elif sig == -1 and not self.position and not trend_ok:
+                self.sell(size=SHORT_TRADE_SIZE)
+                self.entry_price = price
                 self.bars_held = 0
+
+            # CLOSE LONG: sig == -2, hold minimo rispettato
+            elif sig == -2 and self.position.is_long:
+                if self.bars_held < MIN_HOLD_BARS:
+                    return
+                self.position.close()
+                self._reset()
+
+            # CLOSE SHORT: sig == +2, hold minimo rispettato
+            elif sig == 2 and self.position.is_short:
+                if self.bars_held < SHORT_MIN_HOLD:
+                    return
+                self.position.close()
+                self._reset()
+
+        def _reset(self):
+            self.entry_price = None
+            self.bars_held = 0
 
     # backtesting.py richiede colonne con la prima lettera maiuscola
     bt_df = raw_aligned.rename(columns={
@@ -680,23 +846,46 @@ def backtest(df_raw, df_feat, model, pred_series=None, test_size=0.2):
 # 5. PAPER TRADING LIVE (Binance Testnet)
 # ─────────────────────────────────────────────
 
-def get_testnet_exchange():
+def get_testnet_exchange(exchange_type="spot"):
     """
-    Ritorna un'istanza ccxt connessa al Binance Demo Trading (ex Testnet).
-    Usa enable_demo_trading() che punta a demo-api.binance.com
-    (il vecchio testnet.binance.vision non e' piu' attivo).
+    Ritorna un'istanza ccxt connessa al Binance Demo Trading.
+    exchange_type: "spot" per LONG, "future" per SHORT.
+    Usa enable_demo_trading() che punta a:
+    - demo-api.binance.com (spot)
+    - demo-fapi.binance.com (futures)
     """
-    exchange = ccxt.binance({
-        "apiKey": TESTNET_API_KEY,
-        "secret": TESTNET_SECRET,
-        "options": {
-            "defaultType": "spot",
-            "fetchMarkets": {"types": ["spot"]},
-        },
-    })
-    exchange.enable_demo_trading(True)
-    exchange.load_markets()
-    return exchange
+    if exchange_type == "future":
+        exchange = ccxt.binance({
+            "apiKey": TESTNET_API_KEY,
+            "secret": TESTNET_SECRET,
+            "options": {
+                "defaultType": "future",
+            },
+        })
+        exchange.enable_demo_trading(True)
+        exchange.load_markets()
+        # Leva 1x: nessun leverage, puro short senza margine amplificato
+        try:
+            exchange.set_leverage(1, SYMBOL)
+            print(f"Futures: leverage impostato a 1x per {SYMBOL}")
+        except Exception as e:
+            raise RuntimeError(
+                f"Impossibile impostare leverage 1x su Futures: {e}. "
+                f"Bot non avviato per sicurezza (rischio leverage non controllato)."
+            )
+        return exchange
+    else:
+        exchange = ccxt.binance({
+            "apiKey": TESTNET_API_KEY,
+            "secret": TESTNET_SECRET,
+            "options": {
+                "defaultType": "spot",
+                "fetchMarkets": {"types": ["spot"]},
+            },
+        })
+        exchange.enable_demo_trading(True)
+        exchange.load_markets()
+        return exchange
 
 
 def log_trade(side, qty, price, signal, confidence, pnl_usd=None):
@@ -746,28 +935,38 @@ def send_telegram(message):
 # 5c. PERSISTENZA STATO E MODELLO
 # ─────────────────────────────────────────────
 
-def save_state(entry_price, entry_qty, entry_time=None):
-    """Salva lo stato della posizione su file JSON."""
+def save_state(entry_price, entry_qty, entry_time=None, position_type=None):
+    """Salva lo stato della posizione su file JSON (LONG/SHORT/flat)."""
     with open(STATE_FILE, "w") as f:
         json.dump({
             "entry_price": entry_price,
             "entry_qty": entry_qty,
             "entry_time": entry_time.isoformat() if entry_time else None,
+            "position_type": position_type,  # "long", "short", or None
         }, f)
 
 
 def load_state():
-    """Carica lo stato della posizione da file JSON."""
+    """
+    Carica lo stato della posizione da file JSON.
+    Ritorna (entry_price, entry_qty, entry_time, position_type).
+    Backward compat: vecchi file senza position_type → assume "long" se entry_price esiste.
+    """
     if os.path.isfile(STATE_FILE):
         try:
             with open(STATE_FILE) as f:
                 s = json.load(f)
             et = s.get("entry_time")
             entry_time = datetime.fromisoformat(et) if et else None
-            return s.get("entry_price"), s.get("entry_qty"), entry_time
+            ep = s.get("entry_price")
+            # Backward compat: se entry_price esiste ma position_type manca, assume "long"
+            pt = s.get("position_type")
+            if ep and not pt:
+                pt = "long"
+            return ep, s.get("entry_qty"), entry_time, pt
         except (json.JSONDecodeError, KeyError, ValueError):
             pass
-    return None, None, None
+    return None, None, None, None
 
 
 def save_dashboard_data(price, buy_proba, signal_str, usdt, btc,
@@ -818,78 +1017,135 @@ def save_price_history(df):
         print(f"[WARN] save_price_history fallito: {e}")
 
 
-def save_model(model):
-    """Salva il modello su disco con joblib."""
-    joblib.dump(model, MODEL_FILE)
-    print(f"Modello salvato in {MODEL_FILE}")
+def save_model(model_buy, model_short=None):
+    """Salva i modelli su disco con joblib (dual model: BUY + SHORT)."""
+    joblib.dump(model_buy, MODEL_BUY_FILE)
+    print(f"Modello BUY salvato in {MODEL_BUY_FILE}")
+    if model_short is not None:
+        joblib.dump(model_short, MODEL_SHORT_FILE)
+        print(f"Modello SHORT salvato in {MODEL_SHORT_FILE}")
 
 
 def load_model():
     """
-    Carica il modello da disco se esiste e ha meno di RETRAIN_HOURS ore.
-    Ritorna il modello o None.
+    Carica i modelli da disco se esistono e hanno meno di RETRAIN_HOURS ore.
+    Ritorna (model_buy, model_short) o (None, None).
+    Backward compat: se esiste il vecchio model.joblib, lo usa come model_buy.
     """
-    if not os.path.isfile(MODEL_FILE):
-        return None
-    age_hours = (time.time() - os.path.getmtime(MODEL_FILE)) / 3600
-    if age_hours > RETRAIN_HOURS:
-        print(f"Modello trovato ma troppo vecchio ({age_hours:.1f}h). Ri-training necessario.")
-        return None
-    model = joblib.load(MODEL_FILE)
-    print(f"Modello caricato da {MODEL_FILE} (eta': {age_hours:.1f}h)")
-    return model
+    model_buy = None
+    model_short = None
+
+    # Prova prima i nuovi file dual
+    if os.path.isfile(MODEL_BUY_FILE):
+        age_hours = (time.time() - os.path.getmtime(MODEL_BUY_FILE)) / 3600
+        if age_hours > RETRAIN_HOURS:
+            print(f"Modello BUY troppo vecchio ({age_hours:.1f}h). Ri-training necessario.")
+            return None, None
+        model_buy = joblib.load(MODEL_BUY_FILE)
+        print(f"Modello BUY caricato da {MODEL_BUY_FILE} (eta': {age_hours:.1f}h)")
+    elif os.path.isfile(MODEL_FILE):
+        # Backward compat: vecchio file singolo
+        age_hours = (time.time() - os.path.getmtime(MODEL_FILE)) / 3600
+        if age_hours > RETRAIN_HOURS:
+            print(f"Modello trovato ma troppo vecchio ({age_hours:.1f}h). Ri-training necessario.")
+            return None, None
+        model_buy = joblib.load(MODEL_FILE)
+        print(f"Modello BUY caricato da {MODEL_FILE} (backward compat, eta': {age_hours:.1f}h)")
+    else:
+        return None, None
+
+    # Carica SHORT se disponibile
+    if os.path.isfile(MODEL_SHORT_FILE):
+        age_hours_s = (time.time() - os.path.getmtime(MODEL_SHORT_FILE)) / 3600
+        if age_hours_s <= RETRAIN_HOURS:
+            model_short = joblib.load(MODEL_SHORT_FILE)
+            print(f"Modello SHORT caricato da {MODEL_SHORT_FILE} (eta': {age_hours_s:.1f}h)")
+        else:
+            print(f"Modello SHORT troppo vecchio ({age_hours_s:.1f}h), SHORT disabilitato.")
+    else:
+        print("Modello SHORT non trovato, SHORT disabilitato nel bot live.")
+
+    return model_buy, model_short
 
 
 def retrain_model():
     """
-    Scarica dati freschi, rigenera feature, allena un nuovo modello
-    e lo salva su disco. Usato per il retraining periodico nel bot live.
+    Scarica dati freschi, rigenera feature, allena nuovi modelli (BUY + SHORT)
+    e li salva su disco. Usato per il retraining periodico nel bot live.
     """
     print("\n=== RETRAINING: scarico dati freschi ===")
     df_raw = fetch_ohlcv()
     df_feat = build_features(df_raw)
     print(f"Retraining su {len(df_feat)} righe")
-    model = train_model(df_feat)
-    save_model(model)
+    model_buy = train_model(df_feat)
+    model_short = None
+    if ENABLE_SHORT:
+        model_short = train_model(df_feat, target_label=-1)
+    save_model(model_buy, model_short)
     send_telegram(
         f"🔄 <b>Retraining completato</b>\n"
-        f"📊 Righe: {len(df_feat)} | Modello aggiornato"
+        f"📊 Righe: {len(df_feat)} | BUY + {'SHORT' if model_short else 'LONG-only'}"
     )
-    return model
+    return model_buy, model_short
 
 
-def run_bot(model):
+def _calc_pnl(price, entry_price, qty, position_type):
+    """Calcola P&L correttamente per LONG e SHORT."""
+    if position_type == "short":
+        pnl_usd = (entry_price - price) * qty
+        pnl_pct = (entry_price - price) / entry_price
+    else:
+        pnl_usd = (price - entry_price) * qty
+        pnl_pct = (price - entry_price) / entry_price
+    return pnl_usd, pnl_pct
+
+
+def run_bot(model_buy, model_short=None):
     """
-    Loop principale del bot (solo LONG su Binance Spot):
-    ogni SLEEP_SECONDS scarica nuovi dati, genera un segnale e
-    piazza ordini sul Binance Testnet.
+    Loop principale del bot:
+    - LONG su Binance Spot Demo (BUY/SELL)
+    - SHORT su Binance Futures Demo (SELL to open / BUY to close)
+    Ogni SLEEP_SECONDS scarica nuovi dati, genera segnali e piazza ordini.
 
     Include:
-    - Stop loss automatico (2%)
-    - Filtro trend EMA20
+    - Stop loss automatico (2% per LONG e SHORT)
+    - Filtro trend EMA20 (BUY solo in uptrend, SHORT solo in downtrend)
     - Retraining periodico ogni RETRAIN_HOURS ore
-    - Persistenza stato su file JSON
+    - Persistenza stato su file JSON (position_type: long/short/None)
     - Notifiche Telegram su trade ed errori
     - Logging trade su CSV
     """
-    exchange = get_testnet_exchange()
-    print(f"\nBot avviato su Binance Testnet | {SYMBOL} | {TIMEFRAME}")
+    # === Exchange setup ===
+    exchange_spot = get_testnet_exchange("spot")
+    exchange_futures = None
+    short_enabled = ENABLE_SHORT and model_short is not None
+    if short_enabled:
+        try:
+            exchange_futures = get_testnet_exchange("future")
+            print("Futures Demo: connesso (leverage 1x)")
+        except Exception as e:
+            print(f"[WARN] Futures non disponibile: {e}. SHORT disabilitato.")
+            short_enabled = False
+
+    mode_str = "LONG+SHORT" if short_enabled else "LONG-only"
+    print(f"\nBot avviato su Binance Demo | {SYMBOL} | {TIMEFRAME} | {mode_str}")
     print("=" * 55)
 
     # Carica stato precedente (sopravvive a restart)
-    entry_price, entry_qty, entry_time = load_state()
+    entry_price, entry_qty, entry_time, position_type = load_state()
     if entry_price:
-        print(f"Stato caricato: posizione aperta @ {entry_price:.2f} "
+        print(f"Stato caricato: {position_type.upper()} @ {entry_price:.2f} "
               f"({entry_qty} BTC)")
 
     last_retrain = time.time()
     last_status  = time.time()
-    STATUS_INTERVAL = 86400  # notifica stato ogni 24 ore
+    STATUS_INTERVAL = 86400
     send_telegram(
-        f"🤖 <b>Bot avviato</b>\n"
+        f"🤖 <b>Bot avviato ({mode_str})</b>\n"
         f"📈 {SYMBOL} | {TIMEFRAME}\n"
         f"🔄 Retraining ogni {RETRAIN_HOURS}h\n"
-        f"🛡 Stop loss: {STOP_LOSS:.0%} | Min confidenza: {MIN_PROBA:.0%}"
+        f"🛡 SL: {STOP_LOSS:.0%} | BUY min: {MIN_PROBA:.0%}"
+        + (f" | SHORT min: {SHORT_MIN_PROBA:.0%}" if short_enabled else "")
     )
 
     consecutive_net_errors = 0
@@ -900,40 +1156,74 @@ def run_bot(model):
             if hours_since >= RETRAIN_HOURS:
                 print(f"\n[RETRAIN] {hours_since:.1f}h dall'ultimo training")
                 try:
-                    model = retrain_model()
+                    model_buy, model_short_new = retrain_model()
+                    if model_short_new and short_enabled:
+                        model_short = model_short_new
                 except Exception as e:
                     print(f"[RETRAIN FALLITO] {e}")
                     send_telegram(
                         f"⚠️ <b>Retraining fallito</b>\n"
                         f"<code>{str(e)[:500]}</code>"
                     )
-                last_retrain = time.time()  # reset timer anche se fallito
+                last_retrain = time.time()
 
+            # --- Fetch dati e segnali ---
             df      = fetch_ohlcv()
             save_price_history(df)
             df_feat = build_features(df)
 
             last_row   = df_feat[FEATURES].iloc[-1:]
-            buy_proba  = model.predict_proba(last_row)[0][1]  # probabilita' BUY
+            buy_proba  = model_buy.predict_proba(last_row)[0][1]
             buy_signal = buy_proba >= MIN_PROBA
 
-            # Segnale SELL tecnico (non ML)
-            sell_signal = technical_sell_signal(df_feat).iloc[-1]
+            short_proba = 0.0
+            short_signal = False
+            if short_enabled and model_short is not None:
+                short_proba = model_short.predict_proba(last_row)[0][1]
+                short_signal = short_proba >= SHORT_MIN_PROBA
 
-            balance = exchange.fetch_balance()
-            usdt    = balance["USDT"]["free"]
-            btc     = balance["BTC"]["free"]
-            price   = df_feat["close"].iloc[-1]
+            # Segnali tecnici di chiusura
+            sell_signal  = technical_sell_signal(df_feat).iloc[-1]   # chiudi LONG
+            cover_signal = technical_cover_signal(df_feat).iloc[-1]  # chiudi SHORT
 
-            signal_str = "BUY" if buy_signal else ("SELL(tech)" if sell_signal else "HOLD")
+            # --- Conflict resolution: se entrambi i modelli sparano -> HOLD ---
+            if buy_signal and short_signal:
+                buy_signal = False
+                short_signal = False
+                print(f"  [CONFLICT] BUY ({buy_proba:.0%}) + SHORT ({short_proba:.0%}) -> HOLD")
+
+            # --- Mutual exclusion posizione: non aprire opposta se gia' in posizione ---
+            if buy_signal and position_type == "short":
+                buy_signal = False  # non aprire LONG mentre SHORT e' aperto
+            if short_signal and position_type == "long":
+                short_signal = False  # non aprire SHORT mentre LONG e' aperto
+
+            # --- Balance (dall'exchange corretto) ---
+            price = df_feat["close"].iloc[-1]
+            if position_type == "short" and exchange_futures:
+                balance = exchange_futures.fetch_balance()
+                usdt = balance.get("USDT", {}).get("free", 0)
+                btc = 0.0  # su Futures il BTC non e' nel wallet come su Spot
+            else:
+                balance = exchange_spot.fetch_balance()
+                usdt = balance["USDT"]["free"]
+                btc  = balance["BTC"]["free"]
+
+            # --- Log stato ---
+            pos_str = f"{position_type.upper()}" if position_type else "FLAT"
+            signal_parts = []
+            if buy_signal: signal_parts.append(f"BUY({buy_proba:.0%})")
+            if short_signal: signal_parts.append(f"SHORT({short_proba:.0%})")
+            if sell_signal and position_type == "long": signal_parts.append("CLOSE_LONG")
+            if cover_signal and position_type == "short": signal_parts.append("CLOSE_SHORT")
+            signal_str = " | ".join(signal_parts) if signal_parts else "HOLD"
             print(
                 f"[{pd.Timestamp.now().strftime('%H:%M:%S')}] "
-                f"Prezzo: {price:.2f} | "
-                f"Signal: {signal_str} (BUY prob: {buy_proba:.0%}) | "
-                f"USDT: {usdt:.2f} | BTC: {btc:.6f}"
+                f"Prezzo: {price:.2f} | {pos_str} | Signal: {signal_str} | "
+                f"USDT: {usdt:.2f}"
             )
 
-            # --- Aggiorna dati dashboard ---
+            # --- Dashboard ---
             try:
                 save_dashboard_data(
                     price, buy_proba, signal_str, usdt, btc,
@@ -941,24 +1231,24 @@ def run_bot(model):
                     df_feat[FEATURES].iloc[-1].to_dict()
                 )
             except Exception as e:
-                print(f"[DASHBOARD] Errore salvataggio: {e}")
+                print(f"[DASHBOARD] Errore: {e}")
 
-            # --- Notifica stato periodica (ogni 30 min, solo lettura) ---
+            # --- Notifica stato periodica ---
             if (time.time() - last_status) >= STATUS_INTERVAL:
                 try:
                     now_str = pd.Timestamp.now().strftime("%H:%M")
-                    if entry_price and btc > 0.0001:
-                        pnl_pct = (price - entry_price) / entry_price
-                        pnl_usd = (price - entry_price) * (entry_qty or 0)
+                    if entry_price and position_type:
+                        pnl_usd, pnl_pct = _calc_pnl(price, entry_price, entry_qty or 0, position_type)
                         pnl_icon = "📈" if pnl_usd >= 0 else "📉"
+                        pos_icon = "🟢" if position_type == "long" else "🔴"
                         send_telegram(
                             f"📊 <b>Status {now_str}</b>\n"
                             f"━━━━━━━━━━━━━━━\n"
-                            f"🟢 In posizione\n"
+                            f"{pos_icon} {position_type.upper()}\n"
                             f"📌 Entry: ${entry_price:,.2f}\n"
                             f"💰 Prezzo: ${price:,.2f}\n"
                             f"{pnl_icon} P&amp;L: {pnl_pct:+.2%} (${pnl_usd:+,.2f})\n"
-                            f"🎯 Signal: {signal_str} ({buy_proba:.0%})"
+                            f"🎯 BUY: {buy_proba:.0%} | SHORT: {short_proba:.0%}"
                         )
                     else:
                         send_telegram(
@@ -967,124 +1257,185 @@ def run_bot(model):
                             f"⚪ Nessuna posizione\n"
                             f"💵 USDT: ${usdt:,.2f}\n"
                             f"💰 BTC: ${price:,.2f}\n"
-                            f"🎯 Signal: {signal_str} ({buy_proba:.0%})"
+                            f"🎯 BUY: {buy_proba:.0%} | SHORT: {short_proba:.0%}"
                         )
                 except Exception as e:
-                    print(f"[STATUS] Errore notifica: {e}")
+                    print(f"[STATUS] Errore: {e}")
                 last_status = time.time()
 
-            # Stop loss check (solo per posizioni long)
-            if entry_price and btc > 0.0001:
-                loss = (price - entry_price) / entry_price
-                if loss <= -STOP_LOSS:
-                    qty = int(btc * 1e6) / 1e6  # tronca a 6 decimali (vendi tutto)
+            # ============================================
+            # STOP LOSS (SEMPRE attivo, prima di tutto)
+            # ============================================
+
+            # Stop loss LONG
+            if position_type == "long" and entry_price and btc > 0.0001:
+                loss_pct = (price - entry_price) / entry_price
+                if loss_pct <= -STOP_LOSS:
+                    qty = int(btc * 1e6) / 1e6
                     pnl_usd = (price - entry_price) * qty
-                    exchange.create_order(SYMBOL, "market", "sell", qty)
-                    # Salva stato SUBITO dopo l'ordine (prima di telegram/dashboard)
-                    entry_price = None
-                    entry_qty = None
-                    entry_time = None
-                    save_state(entry_price, entry_qty, entry_time)
-                    print(f"  -> STOP LOSS: SELL {qty} BTC @ {price:.2f} "
-                          f"(loss: {loss:.2%}, P&L: ${pnl_usd:+,.2f})")
-                    log_trade("SELL(SL)", qty, price, "STOP_LOSS",
-                              buy_proba, pnl_usd)
-                    send_telegram(
-                        f"🛑 <b>Stop Loss</b>\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"🔴 SELL {qty} BTC\n"
-                        f"💰 Prezzo: ${price:,.2f}\n"
-                        f"📉 Loss: {loss:.2%}\n"
-                        f"💸 P&amp;L: ${pnl_usd:+,.2f}"
-                    )
-                    # Aggiorna dashboard subito dopo stop loss
                     try:
-                        bal = exchange.fetch_balance()
-                        save_dashboard_data(price, buy_proba, "STOP_LOSS",
-                            bal["USDT"]["free"], bal["BTC"]["free"],
-                            None, None, df_feat[FEATURES].iloc[-1].to_dict())
-                    except Exception:
-                        pass
-                    print(f"  -> Prossimo ciclo tra {SLEEP_SECONDS // 60} minuti...\n")
+                        exchange_spot.create_order(SYMBOL, "market", "sell", qty)
+                    except Exception as e:
+                        print(f"  [ERRORE] Stop loss LONG fallito: {e}")
+                        send_telegram(f"🚨 <b>Stop Loss LONG fallito</b>\n<code>{e}</code>")
+                        continue
+                    entry_price = None; entry_qty = None; entry_time = None; position_type = None
+                    save_state(entry_price, entry_qty, entry_time, position_type)
+                    print(f"  -> STOP LOSS LONG: SELL {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
+                    log_trade("SELL(SL)", qty, price, "STOP_LOSS_LONG", buy_proba, pnl_usd)
+                    send_telegram(
+                        f"🛑 <b>Stop Loss LONG</b>\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"🔴 SELL {qty} BTC @ ${price:,.2f}\n"
+                        f"📉 Loss: {loss_pct:.2%} | P&amp;L: ${pnl_usd:+,.2f}"
+                    )
+                    time.sleep(SLEEP_SECONDS)
+                    continue  # NON aprire nuove posizioni nello stesso ciclo
+
+            # Stop loss SHORT
+            if position_type == "short" and entry_price and exchange_futures:
+                loss_pct = (entry_price - price) / entry_price  # prezzo sale = perdita
+                if loss_pct <= -SHORT_STOP_LOSS:
+                    qty = entry_qty or 0
+                    pnl_usd = (entry_price - price) * qty
+                    try:
+                        exchange_futures.create_order(SYMBOL, "market", "buy", qty)
+                    except Exception as e:
+                        print(f"  [ERRORE] Stop loss SHORT fallito: {e}")
+                        send_telegram(f"🚨 <b>Stop Loss SHORT fallito</b>\n<code>{e}</code>")
+                        continue
+                    entry_price = None; entry_qty = None; entry_time = None; position_type = None
+                    save_state(entry_price, entry_qty, entry_time, position_type)
+                    print(f"  -> STOP LOSS SHORT: BUY {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
+                    log_trade("BUY(SL)", qty, price, "STOP_LOSS_SHORT", short_proba, pnl_usd)
+                    send_telegram(
+                        f"🛑 <b>Stop Loss SHORT</b>\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"🟢 BUY(cover) {qty} BTC @ ${price:,.2f}\n"
+                        f"📈 Loss: {loss_pct:.2%} | P&amp;L: ${pnl_usd:+,.2f}"
+                    )
                     time.sleep(SLEEP_SECONDS)
                     continue
 
-            # Hold minimo: sopprime SELL tecnico se posizione troppo giovane
-            # (stop loss sopra resta SEMPRE attivo)
-            if sell_signal and entry_time:
+            # ============================================
+            # HOLD MINIMO (sopprime chiusura tecnica)
+            # ============================================
+            if sell_signal and position_type == "long" and entry_time:
                 hours_held = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
                 if hours_held < MIN_HOLD_BARS:
                     sell_signal = False
-                    print(f"  -> SELL soppresso: hold {hours_held:.1f}h < {MIN_HOLD_BARS}h minimo")
+                    print(f"  -> CLOSE LONG soppresso: hold {hours_held:.1f}h < {MIN_HOLD_BARS}h")
 
-            if buy_signal and usdt > 10 and not entry_price:
-                # Filtro trend: compra solo se prezzo > EMA20
+            if cover_signal and position_type == "short" and entry_time:
+                hours_held = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
+                if hours_held < SHORT_MIN_HOLD:
+                    cover_signal = False
+                    print(f"  -> CLOSE SHORT soppresso: hold {hours_held:.1f}h < {SHORT_MIN_HOLD}h")
+
+            # ============================================
+            # APERTURA POSIZIONI (solo se flat)
+            # ============================================
+
+            if buy_signal and usdt > 10 and not position_type:
                 trend_ok = df_feat["trend_up"].iloc[-1] == 1
                 if not trend_ok:
                     print(f"  -> Trend ribassista (prezzo < EMA20), BUY bloccato.")
                 else:
-                    # BUY: entra long
                     qty = round((usdt * TRADE_SIZE) / price, 6)
-                    exchange.create_order(SYMBOL, "market", "buy", qty)
-                    # Salva stato SUBITO dopo l'ordine (prima di telegram/dashboard)
-                    entry_price = price
-                    entry_qty = qty
-                    entry_time = datetime.now(timezone.utc)
-                    save_state(entry_price, entry_qty, entry_time)
-                    print(f"  -> ORDER: BUY {qty} BTC @ {price:.2f} "
-                          f"(BUY prob: {buy_proba:.0%})")
+                    try:
+                        exchange_spot.create_order(SYMBOL, "market", "buy", qty)
+                    except Exception as e:
+                        print(f"  [ERRORE] BUY fallito: {e}")
+                        send_telegram(f"🚨 <b>BUY fallito</b>\n<code>{e}</code>")
+                        continue
+                    entry_price = price; entry_qty = qty
+                    entry_time = datetime.now(timezone.utc); position_type = "long"
+                    save_state(entry_price, entry_qty, entry_time, position_type)
+                    print(f"  -> ORDER: BUY {qty} BTC @ {price:.2f} (prob: {buy_proba:.0%})")
                     log_trade("BUY", qty, price, "BUY", buy_proba)
                     send_telegram(
                         f"🟢 <b>BUY eseguito</b>\n"
                         f"━━━━━━━━━━━━━━━\n"
                         f"🛒 {qty} BTC @ ${price:,.2f}\n"
-                        f"🤖 Confidenza ML: {buy_proba:.0%}\n"
+                        f"🤖 Confidenza: {buy_proba:.0%}\n"
                         f"💵 Investito: ${qty * price:,.2f}"
                     )
-                    # Aggiorna dashboard subito dopo BUY
-                    try:
-                        bal = exchange.fetch_balance()
-                        save_dashboard_data(price, buy_proba, "BUY",
-                            bal["USDT"]["free"], bal["BTC"]["free"],
-                            entry_price, entry_qty,
-                            df_feat[FEATURES].iloc[-1].to_dict())
-                    except Exception:
-                        pass
 
-            elif sell_signal and btc > 0.0001 and entry_price:
-                # SELL tecnico: chiudi long (vendi tutto il BTC)
-                qty = int(btc * 1e6) / 1e6  # tronca a 6 decimali
-                pnl_usd = (price - entry_price) * qty
-                pnl_pct = (price - entry_price) / entry_price
-                exchange.create_order(SYMBOL, "market", "sell", qty)
-                # Salva stato SUBITO dopo l'ordine (prima di telegram/dashboard)
-                entry_price = None
-                entry_qty = None
-                entry_time = None
-                save_state(entry_price, entry_qty, entry_time)
-                print(f"  -> ORDER: SELL(tech) {qty} BTC @ {price:.2f} "
-                      f"(P&L: ${pnl_usd:+,.2f})")
+            elif short_signal and short_enabled and usdt > 10 and not position_type:
+                trend_down = df_feat["trend_up"].iloc[-1] == 0
+                if not trend_down:
+                    print(f"  -> Trend rialzista (prezzo > EMA20), SHORT bloccato.")
+                else:
+                    qty = round((usdt * SHORT_TRADE_SIZE) / price, 6)
+                    try:
+                        exchange_futures.create_order(SYMBOL, "market", "sell", qty)
+                    except Exception as e:
+                        print(f"  [ERRORE] SHORT fallito: {e}")
+                        send_telegram(f"🚨 <b>SHORT fallito</b>\n<code>{e}</code>")
+                        continue
+                    entry_price = price; entry_qty = qty
+                    entry_time = datetime.now(timezone.utc); position_type = "short"
+                    save_state(entry_price, entry_qty, entry_time, position_type)
+                    print(f"  -> ORDER: SHORT {qty} BTC @ {price:.2f} (prob: {short_proba:.0%})")
+                    log_trade("SHORT", qty, price, "SHORT", short_proba)
+                    send_telegram(
+                        f"🔴 <b>SHORT eseguito</b>\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"📉 {qty} BTC @ ${price:,.2f}\n"
+                        f"🤖 Confidenza: {short_proba:.0%}\n"
+                        f"💵 Margine: ${qty * price:,.2f}"
+                    )
+
+            # ============================================
+            # CHIUSURA POSIZIONI (segnali tecnici)
+            # ============================================
+
+            elif sell_signal and position_type == "long" and btc > 0.0001:
+                qty = int(btc * 1e6) / 1e6
+                pnl_usd, pnl_pct = _calc_pnl(price, entry_price, qty, "long")
+                try:
+                    exchange_spot.create_order(SYMBOL, "market", "sell", qty)
+                except Exception as e:
+                    print(f"  [ERRORE] CLOSE LONG fallito: {e}")
+                    send_telegram(f"🚨 <b>CLOSE LONG fallito</b>\n<code>{e}</code>")
+                    continue
+                entry_price = None; entry_qty = None; entry_time = None; position_type = None
+                save_state(entry_price, entry_qty, entry_time, position_type)
+                print(f"  -> ORDER: CLOSE LONG {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
                 log_trade("SELL", qty, price, "SELL_TECH", buy_proba, pnl_usd)
                 pnl_icon = "📈" if pnl_usd >= 0 else "📉"
                 send_telegram(
-                    f"🔴 <b>SELL eseguito</b>\n"
+                    f"🔴 <b>CLOSE LONG</b>\n"
                     f"━━━━━━━━━━━━━━━\n"
                     f"💼 {qty} BTC @ ${price:,.2f}\n"
                     f"{pnl_icon} P&amp;L: {pnl_pct:+.2%} (${pnl_usd:+,.2f})"
                 )
-                # Aggiorna dashboard subito dopo SELL
+
+            elif cover_signal and position_type == "short" and exchange_futures:
+                qty = entry_qty or 0
+                pnl_usd, pnl_pct = _calc_pnl(price, entry_price, qty, "short")
                 try:
-                    bal = exchange.fetch_balance()
-                    save_dashboard_data(price, buy_proba, "SELL",
-                        bal["USDT"]["free"], bal["BTC"]["free"],
-                        None, None, df_feat[FEATURES].iloc[-1].to_dict())
-                except Exception:
-                    pass
+                    exchange_futures.create_order(SYMBOL, "market", "buy", qty)
+                except Exception as e:
+                    print(f"  [ERRORE] CLOSE SHORT fallito: {e}")
+                    send_telegram(f"🚨 <b>CLOSE SHORT fallito</b>\n<code>{e}</code>")
+                    continue
+                entry_price = None; entry_qty = None; entry_time = None; position_type = None
+                save_state(entry_price, entry_qty, entry_time, position_type)
+                print(f"  -> ORDER: CLOSE SHORT {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
+                log_trade("COVER", qty, price, "COVER_TECH", short_proba, pnl_usd)
+                pnl_icon = "📈" if pnl_usd >= 0 else "📉"
+                send_telegram(
+                    f"🟢 <b>CLOSE SHORT</b>\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"💼 BUY(cover) {qty} BTC @ ${price:,.2f}\n"
+                    f"{pnl_icon} P&amp;L: {pnl_pct:+.2%} (${pnl_usd:+,.2f})"
+                )
 
             else:
                 print(f"  -> HOLD (nessuna azione)")
 
-            consecutive_net_errors = 0  # ciclo OK, reset contatore
+            consecutive_net_errors = 0
 
         except TRANSIENT_ERRORS as e:
             consecutive_net_errors += 1
@@ -1094,14 +1445,14 @@ def run_bot(model):
                 print(f"[RETRY {consecutive_net_errors}/{MAX_RETRIES}] {err_msg}")
                 print(f"  -> Riprovo tra {wait}s...")
                 time.sleep(wait)
-                continue  # riprova subito, senza aspettare SLEEP_SECONDS
+                continue
             else:
                 print(f"[ERRORE] {err_msg} (dopo {MAX_RETRIES} tentativi)")
                 send_telegram(
                     f"🚨 <b>Errore di rete</b> (dopo {MAX_RETRIES} tentativi)\n"
                     f"<code>{err_msg[:500]}</code>"
                 )
-                consecutive_net_errors = 0  # reset dopo notifica
+                consecutive_net_errors = 0
 
         except Exception as e:
             err_msg = f"{type(e).__name__}: {e}"
@@ -1121,12 +1472,12 @@ def run_bot(model):
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Prova a caricare un modello recente da disco
-    model = load_model()
+    # Prova a caricare modelli recenti da disco (dual: BUY + SHORT)
+    model_buy, model_short = load_model()
 
-    if model is not None:
+    if model_buy is not None:
         print("Modello caricato da disco - skip training.")
-        print("Per forzare il retraining, cancella model.joblib\n")
+        print(f"Per forzare il retraining, cancella {MODEL_BUY_FILE} e {MODEL_SHORT_FILE}\n")
         # Genera price_history.json per la dashboard anche senza training
         try:
             df_raw = fetch_ohlcv()
@@ -1141,27 +1492,46 @@ if __name__ == "__main__":
 
         print("\n=== CRYPTOBOT: fase 2 - feature engineering ===")
         df_feat = build_features(df_raw)
-        print(f"Dataset dopo feature engineering: {len(df_feat)} righe")
+        print(f"Dataset dopo feature engineering: {len(df_feat)} righe, {len(FEATURES)} features")
 
-        print("\n=== CRYPTOBOT: fase 2b - ottimizzazione iperparametri ===")
-        best_params = optimize_hyperparams(df_feat)
+        # Fase 2b: Ottimizzazione iperparametri (separata per BUY e SHORT)
+        print("\n=== CRYPTOBOT: fase 2b - ottimizzazione iperparametri BUY ===")
+        best_params_buy = optimize_hyperparams(df_feat, target_label=1, cache_file=OPTUNA_BUY_FILE)
 
-        print("\n=== CRYPTOBOT: fase 3 - walk-forward training ===")
-        model, wf_predictions = walk_forward_train(df_feat, best_params=best_params)
+        best_params_short = None
+        if ENABLE_SHORT:
+            print("\n=== CRYPTOBOT: fase 2b - ottimizzazione iperparametri SHORT ===")
+            best_params_short = optimize_hyperparams(df_feat, target_label=-1, cache_file=OPTUNA_SHORT_FILE)
 
-        # Feature importance dall'ultimo modello
-        print("\n=== Feature Importance (ultimo fold) ===")
-        importances = model.feature_importances_
+        # Fase 3: Walk-forward (dual model)
+        print("\n=== CRYPTOBOT: fase 3 - walk-forward training (LONG+SHORT) ===")
+        model_buy, model_short, wf_predictions = walk_forward_train(
+            df_feat, best_params_buy=best_params_buy, best_params_short=best_params_short
+        )
+
+        # Feature importance BUY (ultimo fold)
+        print("\n=== Feature Importance BUY (ultimo fold) ===")
+        importances = model_buy.feature_importances_
         feat_imp = sorted(zip(FEATURES, importances), key=lambda x: x[1], reverse=True)
         for feat, imp in feat_imp:
             bar = "#" * int(imp * 50)
             print(f"  {feat:>15}: {imp:.4f} {bar}")
 
-        # Salva il modello per riusi futuri
-        save_model(model)
+        # Feature importance SHORT (se disponibile)
+        if model_short is not None:
+            print("\n=== Feature Importance SHORT (ultimo fold) ===")
+            importances_s = model_short.feature_importances_
+            feat_imp_s = sorted(zip(FEATURES, importances_s), key=lambda x: x[1], reverse=True)
+            for feat, imp in feat_imp_s:
+                bar = "#" * int(imp * 50)
+                print(f"  {feat:>15}: {imp:.4f} {bar}")
 
-        print("\n=== CRYPTOBOT: fase 4 - backtest (walk-forward out-of-sample) ===")
-        backtest(df_raw, df_feat, model, pred_series=wf_predictions)
+        # Salva i modelli per riusi futuri
+        save_model(model_buy, model_short)
+
+        # Fase 4: Backtest
+        print("\n=== CRYPTOBOT: fase 4 - backtest (walk-forward out-of-sample, LONG+SHORT) ===")
+        backtest(df_raw, df_feat, model_buy, model_short, pred_series=wf_predictions)
 
     # Decommenta la riga sotto per avviare il bot live sul testnet
-    #run_bot(model)
+    #run_bot(model_buy, model_short)
