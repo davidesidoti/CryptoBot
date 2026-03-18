@@ -31,16 +31,20 @@ run_bot() - loop live: LONG su Spot Demo + SHORT su Futures Demo, ogni 15 min
 
 | Metrica | LONG+SHORT | B&H |
 |---------|-----------|-----|
-| Return | **+35.0%** | -8.9% |
-| Sharpe | 1.33 | — |
-| Sortino | 3.19 | — |
-| Profit Factor | 1.48 | — |
-| Win Rate | 47.5% | — |
-| Trade | 177 | — |
-| Max Drawdown | -11.9% | — |
-| Exposure | 34.5% | 100% |
+| Return | **+67.6%** | -8.9% |
+| Sharpe | **2.04** | — |
+| Sortino | **6.70** | — |
+| Calmar | **7.05** | — |
+| Profit Factor | 1.87 | — |
+| Win Rate | 48.5% | — |
+| Trade | 194 | — |
+| Max Drawdown | -10.1% | — |
+| Avg Trade | +0.35% | — |
+| Exposure | 38.3% | 100% |
+| SQN | 2.48 | — |
+| P&L netto | **+$337.91** (su $500) | — |
 
-Alpha: **+44 punti percentuali** rispetto a Buy & Hold.
+Alpha: **+76 punti percentuali** rispetto a Buy & Hold.
 
 ## Quick Start
 

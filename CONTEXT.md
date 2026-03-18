@@ -269,17 +269,19 @@ Dashboard web (Flask + Tailwind CSS + Chart.js + Lightweight Charts) con:
 
 | Metrica | Valore |
 |---------|--------|
-| Return | +35.0% |
-| Sharpe | 1.33 |
-| Sortino | 3.19 |
-| Profit Factor | 1.48 |
-| Win Rate | 47.5% |
-| # Trade | 177 |
-| Max Drawdown | -11.9% |
-| Avg Trade | +0.22% |
-| Avg Duration | 15h |
-| SQN | 1.49 |
-| Exposure Time | 34.5% |
+| Return | +67.6% |
+| Sharpe | 2.04 |
+| Sortino | 6.70 |
+| Calmar | 7.05 |
+| Profit Factor | 1.87 |
+| Win Rate | 48.5% |
+| # Trade | 194 |
+| Max Drawdown | -10.1% |
+| Avg Trade | +0.35% |
+| Avg Duration | 16h |
+| SQN | 2.48 |
+| Exposure Time | 38.3% |
+| P&L netto | +$337.91 (su $500) |
 
 ---
 
