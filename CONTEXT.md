@@ -2,11 +2,12 @@
 
 ## Obiettivo del progetto
 
-Bot di trading crypto basato su ML che opera su **Binance Testnet** (soldi finti, dati reali).
+Bot di trading crypto basato su ML che opera su **Binance Demo Trading** (soldi finti, dati reali).
+Dual-model: **LONG** (Spot) + **SHORT** (Futures), entrambi su demo endpoint.
 Il bot scarica candele OHLCV, genera feature tecniche, ottimizza iperparametri con Optuna,
-allena un classificatore XGBoost con walk-forward validation, backtesta la strategia,
-e gira in loop live piazzando ordini sul testnet di Binance.
-Dashboard web (Flask) per monitorare il bot in tempo reale.
+allena due classificatori XGBoost con walk-forward validation, backtesta la strategia LONG+SHORT,
+e gira in loop live piazzando ordini su Binance Demo.
+Dashboard web (Flask) per monitoraggio real-time con signal log dettagliato.
 
 ---
 
@@ -16,10 +17,11 @@ Dashboard web (Flask) per monitorare il bot in tempo reale.
 |---------------------|-----------------------------------|
 | Dati di mercato     | `ccxt` + Binance public API       |
 | Feature engineering | `pandas-ta`                       |
-| Modello ML          | `XGBClassifier` (xgboost)         |
-| Ottimizzazione HP   | `optuna`                          |
+| Modello ML          | `XGBClassifier` (xgboost) x2      |
+| Ottimizzazione HP   | `optuna` (2x: BUY + SHORT)       |
 | Backtest            | `backtesting.py`                  |
-| Esecuzione ordini   | `ccxt` + Binance Testnet          |
+| Esecuzione LONG     | `ccxt` + Binance Spot Demo        |
+| Esecuzione SHORT    | `ccxt` + Binance Futures Demo     |
 | Dashboard           | `flask` + Chart.js + Tailwind CSS |
 | Notifiche           | Telegram Bot API                  |
 | Linguaggio          | Python 3.10+                      |
@@ -38,16 +40,16 @@ pip install ccxt pandas numpy scikit-learn xgboost pandas-ta backtesting flask o
 
 ```
 Binance public API (dati OHLCV storici, 10000 candele paginato, ~416 giorni)
-        ↓
-build_features() → 23 feature (1h + 4h + 1d multi-timeframe) + target dinamico ATR
-        ↓
-optimize_hyperparams() → Optuna bayesian search (50 trial), cache 48h in best_params.json
-        ↓
-walk_forward_train() → XGBoost binary (BUY vs NO-BUY), ~41 fold scorrevoli, usa parametri Optuna
-        ↓
-backtest() → backtesting.py → stats + P&L in $ + plot interattivo
-        ↓
-run_bot() → loop live su Binance Testnet ogni SLEEP_SECONDS (15 min)
+        |
+build_features() -> 25 feature (1h + 4h + 1d multi-timeframe) + target dinamico ATR
+        |
+optimize_hyperparams() -> 2x Optuna bayesian search (50 trial ciascuno), cache 48h
+        |
+walk_forward_train() -> dual XGBoost (BUY + SHORT), ~41 fold scorrevoli
+        |
+backtest() -> backtesting.py LONG+SHORT -> stats + P&L in $ + plot
+        |
+run_bot() -> loop live: LONG su Spot Demo + SHORT su Futures Demo, ogni 15 min
 ```
 
 ---
@@ -55,27 +57,27 @@ run_bot() → loop live su Binance Testnet ogni SLEEP_SECONDS (15 min)
 ## File del progetto
 
 ### File principali
-- **`cryptobot.py`** — bot completo, tutto autocontenuto
+- **`cryptobot.py`** — bot completo, tutto autocontenuto (dual model LONG+SHORT)
 - **`dashboard.py`** — Flask web app per monitoraggio real-time (porta 5050)
-- **`templates/dashboard.html`** — dashboard HTML (dark theme, Chart.js, auto-refresh 30s)
+- **`templates/dashboard.html`** — dashboard HTML (dark theme, Chart.js, signal log, auto-refresh 30s)
 
 ### Sezioni principali di `cryptobot.py`
 
-1. **CONFIG** (in cima al file) — tutte le variabili configurabili
-2. **`fetch_ohlcv()`** — scarica candele da Binance con paginazione (endpoint pubblico, no auth)
-3. **`build_features()`** — indicatori 1h + multi-timeframe (4h, 1d) + target dinamico ATR
-4. **`optimize_hyperparams()`** — Optuna bayesian search, cache su disco per 48h
-5. **`train_model()`** — XGBoost binary (BUY vs NO-BUY), usato per retraining live
-6. **`technical_sell_signal()`** — segnali SELL basati su regole tecniche (RSI > 75, MACD 2-bar, EMA20)
-7. **`walk_forward_train()`** — walk-forward con ~41 fold scorrevoli, usa parametri Optuna
-8. **`backtest()`** — strategia ML su backtesting.py con stop loss, trend filter, hold minimo, P&L in $
-9. **`save_dashboard_data()`** — scrive snapshot del ciclo per la dashboard web
-10. **`get_testnet_exchange()`** — istanza ccxt puntata al Binance Demo Trading
-11. **`save_state()` / `load_state()`** — persistenza posizione + entry_time su JSON
-12. **`log_trade()`** — logging trade su CSV
-13. **`run_bot()`** — loop live con BUY ML + SELL tecnico + stop loss + hold minimo + trend filter
-14. **`__main__`** — esegue fetch → ottimizzazione → walk-forward → backtest;
-    `run_bot()` e' commentato, da decommentare per andare live
+1. **CONFIG** (in cima al file) — tutte le variabili configurabili (incluse SHORT_*)
+2. **`fetch_ohlcv()`** — scarica candele da Binance con paginazione (exchange instance cached, fallback demo endpoint)
+3. **`build_features()`** — indicatori 1h + multi-timeframe (4h, 1d) + target dinamico ATR per BUY e SHORT
+4. **`optimize_hyperparams()`** — Optuna bayesian search, separata per BUY e SHORT, cache su disco 48h
+5. **`train_model()`** — XGBoost binary, usato per retraining live (target_label=1 per BUY, -1 per SHORT)
+6. **`technical_sell_signal()`** — segnali chiusura LONG (RSI > 75, MACD 2-bar, EMA20 break)
+7. **`technical_cover_signal()`** — segnali chiusura SHORT (RSI < 30, MACD bullish, prezzo > EMA20)
+8. **`walk_forward_train()`** — walk-forward dual model, ~41 fold scorrevoli, parametri Optuna
+9. **`backtest()`** — strategia ML LONG+SHORT su backtesting.py con stop loss, trend filter, hold minimo
+10. **`save_dashboard_data()`** — scrive snapshot con signal_log (action, reason, trend, position_type)
+11. **`get_testnet_exchange()`** — factory: "spot" per LONG, "future" per SHORT (leverage 1x, fail-fast)
+12. **`save_state()` / `load_state()`** — persistenza posizione + entry_time + position_type su JSON
+13. **`_calc_pnl()`** — helper P&L corretto per LONG e SHORT
+14. **`run_bot()`** — loop live: dual exchange, dual model, conflict resolution, try/except su ogni ordine
+15. **`__main__`** — pipeline + flag `--backtest` per skip training
 
 ---
 
@@ -88,155 +90,149 @@ FETCH_LIMIT     = 10000       # candele storiche (~416 giorni, paginato)
 FUTURE_BARS     = 5           # candele in avanti per calcolare il label
 SIGNAL_THRESH   = 0.007       # soglia minima 0.7%, override da ATR dinamico
 MIN_PROBA       = 0.55        # confidenza minima per ordine BUY
-TRADE_SIZE      = 0.95        # % del capitale per ogni ordine
-STOP_LOSS       = 0.02        # 2% stop loss
+TRADE_SIZE      = 0.95        # % del capitale per ogni ordine LONG
+STOP_LOSS       = 0.02        # 2% stop loss LONG
 INITIAL_CASH    = 500         # capitale backtest (USD)
 SLEEP_SECONDS   = 900         # pausa tra cicli del bot (15 min)
-MAX_RETRIES     = 3           # tentativi per errori di rete transitori
-RETRY_BACKOFF   = [30, 60, 120]  # secondi di attesa tra retry
-MIN_HOLD_BARS   = 5           # hold minimo 5h prima di SELL tecnico (stop loss escluso)
-LOG_FILE        = "trades_log.csv"
-RETRAIN_HOURS   = 24          # riaddestra ogni N ore
-MODEL_FILE      = "model.joblib"
+MIN_HOLD_BARS   = 5           # hold minimo 5h prima di CLOSE LONG
+
+# SHORT-specific
+ENABLE_SHORT      = True
+SHORT_MIN_PROBA   = 0.60      # confidenza minima per ordine SHORT (piu' alta di BUY)
+SHORT_TRADE_SIZE  = 0.70      # 70% del capitale per SHORT (piu' conservativo)
+SHORT_STOP_LOSS   = 0.02      # 2% stop loss SHORT
+SHORT_MIN_HOLD    = 3         # hold minimo 3h prima di CLOSE SHORT
+
+# Infrastruttura
+MAX_RETRIES     = 3
+RETRY_BACKOFF   = [30, 60, 120]
+RETRAIN_HOURS   = 24
+MODEL_BUY_FILE  = "model_buy.joblib"
+MODEL_SHORT_FILE = "model_short.joblib"
 STATE_FILE      = "bot_state.json"
 DASHBOARD_FILE  = "dashboard_data.json"
-OPTUNA_FILE     = "best_params.json"
-OPTUNA_TRIALS   = 50          # trial per ricerca bayesiana
-WF_TRAIN_BARS   = 1500        # walk-forward: candele per finestra training
-WF_TEST_BARS    = 200         # walk-forward: candele per finestra test
+OPTUNA_BUY_FILE = "best_params_buy.json"
+OPTUNA_SHORT_FILE = "best_params_short.json"
+OPTUNA_TRIALS   = 50
+WF_TRAIN_BARS   = 1500
+WF_TEST_BARS    = 200
 ```
 
 ---
 
-## Feature usate dal modello (23 totali)
+## Feature usate dai modelli (25 totali)
 
 ```python
 FEATURES = [
     # === Timeframe 1h (base) ===
-    "rsi",          # RSI 14
-    "macd",         # MACD line (12,26,9)
-    "macd_signal",  # MACD signal line
-    "bb_width",     # Larghezza Bollinger Bands normalizzata
-    "vol_change",   # Variazione % volume candela precedente
-    "price_change", # Variazione % prezzo candela precedente
-    "ema_cross",    # EMA9 - EMA21 (differenza)
-    "atr",          # Average True Range 14
-    "obv_change",   # % variazione OBV
-    "stoch_k",      # Stochastic K
-    "rsi_slope",    # diff(RSI, 5) — momentum dell'RSI
-    "hour",         # ora della candela (pattern intraday)
-    "adx",          # Average Directional Index 14 (forza trend)
-    "willr",        # Williams %R 14 (ipercomprato/ipervenduto)
-    "vwap_dist",    # distanza % dal VWAP rolling 20
+    "rsi", "macd", "macd_signal", "macd_hist", "bb_width",
+    "vol_change", "price_change", "ema_cross", "atr",
+    "obv_change", "stoch_k", "rsi_slope", "hour",
+    "adx", "willr", "vwap_dist",
     # === Multi-timeframe (resample da 1h) ===
-    "rsi_4h",       # RSI su candele 4h
-    "macd_4h",      # MACD su candele 4h
-    "ema_cross_4h", # EMA9-EMA21 su candele 4h
-    "trend_4h",     # prezzo > EMA20 su 4h (0/1)
-    "rsi_1d",       # RSI su candele daily
-    "adx_1d",       # ADX su candele daily (forza trend daily)
+    "rsi_4h", "macd_4h", "ema_cross_4h", "trend_4h",
+    "rsi_1d", "adx_1d",
     # === Regime / volatilita' ===
-    "atr_ratio",    # ATR(7) / ATR(28) — >1 = vol in aumento
-    "vol_regime"    # volume / SMA(volume, 20) — >1 = volume sopra media
+    "atr_ratio", "vol_regime",
+    # === Trend direction ===
+    "trend_down",   # prezzo < EMA20 (feature + filtro SHORT)
 ]
 ```
 
 ---
 
-## Label / target
+## Label / target (dual)
 
-**Binary classification**: BUY (1) vs NO-BUY (0).
+**BUY model** — Binary classification: BUY (1) vs NO-BUY (0).
+- `1` (BUY) -> prezzo sale > soglia dinamica nelle prossime 5 candele
+- Soglia dinamica: `max(0.7%, ATR% * 0.5)`
 
-- `1` (BUY) → prezzo sale > soglia dinamica nelle prossime 5 candele
-- `0` (NO-BUY) → tutto il resto (HOLD + SELL)
+**SHORT model** — Binary classification: SHORT (-1) vs NO-SHORT (0).
+- `-1` (SHORT) -> prezzo scende > soglia dinamica nelle prossime 5 candele
+- Stessa soglia dinamica ATR
 
-La soglia e' **dinamica**, basata su ATR: `max(0.7%, ATR% * 0.5)`.
-In mercati volatili la soglia si alza automaticamente, riducendo i falsi segnali.
-
-Il segnale SELL e' gestito da **regole tecniche** (non ML):
-- RSI > 75 e in discesa (ipercomprato)
-- MACD cross ribassista confermato (2 barre consecutive)
-- Prezzo sotto EMA20 con drop > 0.8%
-
-**Hold minimo**: SELL tecnico soppresso per 5h dopo BUY. Stop loss (2%) sempre attivo.
+**Chiusura posizioni** (regole tecniche, non ML):
+- CLOSE LONG: RSI > 75 in discesa, MACD cross ribassista 2-bar, prezzo < EMA20 drop > 0.8%
+- CLOSE SHORT: RSI < 30 in salita, MACD cross rialzista 2-bar, prezzo > EMA20 gain > 0.5%
 
 ---
 
-## Logica ordini nel bot live (solo LONG, Binance Spot)
+## Logica ordini nel bot live (LONG + SHORT)
 
 ```
-# Stop loss (SEMPRE attivo, anche durante hold minimo)
-if posizione_aperta and loss >= STOP_LOSS (2%):
-    chiudi posizione, logga su CSV, notifica Telegram
+# Stop loss (SEMPRE attivo, prima di tutto)
+if posizione LONG and loss >= 2%: chiudi su Spot, continue (no nuova posizione)
+if posizione SHORT and loss >= 2%: chiudi su Futures, continue
 
-# Hold minimo: sopprime SELL tecnico se posizione < MIN_HOLD_BARS ore
-if sell_signal and ore_hold < MIN_HOLD_BARS (5h):
-    sell_signal = False
+# Conflict resolution
+if buy_signal AND short_signal: entrambi a False -> HOLD
 
-# Filtro trend
-if prezzo < EMA20: blocca tutti i BUY
+# Mutual exclusion
+if buy_signal AND posizione SHORT: buy_signal = False
+if short_signal AND posizione LONG: short_signal = False
 
-# BUY (segnale ML binary)
-if buy_proba >= MIN_PROBA (0.55) and USDT > $10 and no posizione and trend_up:
-    entra long (BUY 95% USDT), logga su CSV, notifica Telegram
-    salva entry_time per hold minimo
+# Hold minimo (sopprime chiusura tecnica, stop loss escluso)
+if sell_signal and ore_hold < 5h: sell_signal = False
+if cover_signal and ore_hold < 3h: cover_signal = False
 
-# SELL (segnale tecnico, non ML)
-if sell_signal_tecnico and BTC > 0.0001 and posizione_aperta:
-    chiudi long (SELL 95% BTC), logga P&L su CSV, notifica Telegram
+# OPEN LONG (ML BUY signal)
+if buy_proba >= 55% and USDT > $10 and FLAT and trend_up (prezzo > EMA20):
+    BUY su Spot Demo, salva stato position_type="long"
 
-altrimenti: HOLD
+# OPEN SHORT (ML SHORT signal)
+if short_proba >= 60% and USDT > $10 and FLAT and trend_down (prezzo < EMA20):
+    SELL su Futures Demo (leva 1x), salva stato position_type="short"
 
-# Dashboard update (ogni ciclo, non-blocking)
-salva snapshot su dashboard_data.json
+# CLOSE LONG (segnale tecnico)
+if sell_signal and posizione LONG:
+    SELL su Spot Demo, azzera stato
 
-# Retraining periodico (ogni RETRAIN_HOURS)
-se ore_dall_ultimo_training >= RETRAIN_HOURS:
-    scarica dati freschi, riallena modello, salva su disco
+# CLOSE SHORT (segnale tecnico cover)
+if cover_signal and posizione SHORT:
+    BUY(cover) su Futures Demo, azzera stato
 
-# Retry errori di rete
-se ccxt.NetworkError → riprova fino a 3 volte (30s, 60s, 120s backoff)
-se tutti i retry falliscono → notifica Telegram
-se errore non di rete → notifica Telegram immediata
+altrimenti: HOLD (con motivo dettagliato nel signal_log)
 
-# Notifiche Telegram
-BUY/SELL/STOP_LOSS/ERRORE → messaggio immediato
-STATUS → 1 volta al giorno (STATUS_INTERVAL = 86400)
+# Dashboard (ogni ciclo)
+salva snapshot + signal_log con action/reason/trend/position_type
+
+# Retraining periodico (ogni 24h)
+riaddestra entrambi i modelli con dati freschi
 ```
 
 ---
 
-## Binance Demo Trading — come ottenerlo
+## Binance Demo Trading — setup
 
 1. Vai su **https://demo.binance.com/** (richiede account Binance reale)
 2. Accedi con il tuo account Binance
 3. Genera API Key dal pannello Demo Trading
-4. Copia API Key e Secret nel file `.env`
+4. Assicurati che **Enable Futures** sia spuntato
+5. Copia API Key e Secret nel file `.env`
 
-**Nota**: le chiavi da `demo.binance.com` e `testnet.binance.vision` NON sono intercambiabili.
-Il bot usa ccxt con `exchange.enable_demo_trading(True)`.
-
-Il testnet fornisce automaticamente un wallet con BTC e USDT finti.
-I dati di mercato usati dal bot vengono dalla Binance pubblica (reali).
+Stesse chiavi funzionano per Spot Demo e Futures Demo.
+- Spot Demo endpoint: `demo-api.binance.com`
+- Futures Demo endpoint: `demo-fapi.binance.com`
 
 ---
 
 ## Dashboard di monitoraggio
 
 ```bash
-# In un terminale separato:
 python dashboard.py
 # Apri http://localhost:5050 (o http://IP_VPS:5050)
 ```
 
 Dashboard web (Flask + Tailwind CSS + Chart.js + Lightweight Charts) con:
 - Cards: prezzo BTC (con sparkline), segnale, confidenza ML, saldo USDT/BTC, P&L
-- Countdown bar al prossimo ciclo bot (aggiornamento ogni secondo)
-- Flash + count-up animato sui numeri quando cambiano
+- Countdown bar al prossimo ciclo bot
+- **Decisione Corrente**: azione presa + motivo dettagliato + trend + posizione
+- **Modelli ML**: barre di confidenza BUY e SHORT con soglie visualizzate
+- **Signal Log**: cronologia scrollabile degli ultimi 50 cicli (orario, prezzo, trend, azione, motivo)
 - Grafico candlestick BTC/USDT (ultime 100 candele 1h, TradingView Lightweight Charts)
 - Equity curve interattiva
 - Radar delle feature ML
-- Activity feed delle azioni recenti del bot
+- Activity feed trade recenti
 - Toast notification animati per nuovi trade
 - Tabella ultimi 20 trade
 - Dark theme, responsive, auto-refresh 30s
@@ -245,57 +241,58 @@ Dashboard web (Flask + Tailwind CSS + Chart.js + Lightweight Charts) con:
 
 ## Stato attuale del progetto
 
-- [x] Fetch dati OHLCV paginato (10000 candele, ~416 giorni)
-- [x] Feature engineering multi-timeframe (23 feature: 1h + 4h + 1d)
-- [x] Ottimizzazione iperparametri Optuna (50 trial, cache 48h)
-- [x] Binary classification (BUY vs NO-BUY) con scale_pos_weight
-- [x] Target dinamico basato su ATR (riduce falsi segnali in alta volatilita')
-- [x] SELL tramite regole tecniche confermate (RSI 75, MACD 2-bar, EMA 0.8%)
-- [x] Walk-forward validation (~41 fold scorrevoli, fallback per fold degeneri)
-- [x] Backtest con backtesting.py (stats + plot + P&L in $)
-- [x] Stop loss automatico (2%) nel backtest e nel bot live
-- [x] Hold minimo 5h per evitare uscite premature
-- [x] Filtro trend EMA20 (blocca BUY in downtrend)
-- [x] Loop live su Binance Testnet (solo long, no short su spot, ciclo 15 min)
-- [x] Filtro confidenza su predict_proba (MIN_PROBA = 0.55)
-- [x] Logging trade su CSV (trades_log.csv)
-- [x] Feature importance analysis
-- [x] Retraining periodico automatico (ogni 24h con dati freschi)
-- [x] Persistenza modello su disco (joblib)
-- [x] Persistenza stato posizione + entry_time (bot_state.json)
-- [x] Notifiche Telegram (trade, stop loss, errori, retraining, status giornaliero)
-- [x] Dashboard web (Flask + Chart.js + Tailwind, porta 5050)
+- [x] Fetch dati OHLCV paginato (10000 candele, ~416 giorni, exchange cached + fallback demo)
+- [x] Feature engineering multi-timeframe (25 feature: 1h + 4h + 1d + regime + trend)
+- [x] Dual model: BUY + SHORT con ottimizzazione Optuna separata (50 trial ciascuno)
+- [x] Walk-forward validation (~41 fold, fallback per fold degeneri)
+- [x] Backtest LONG+SHORT con backtesting.py (stats + plot + P&L in $)
+- [x] CLOSE LONG: regole tecniche (RSI 75, MACD 2-bar, EMA 0.8%)
+- [x] CLOSE SHORT: regole tecniche cover (RSI 30, MACD bullish, EMA 0.5%)
+- [x] Stop loss 2% per LONG e SHORT
+- [x] Hold minimo: 5h LONG, 3h SHORT
+- [x] Filtro trend EMA20: BUY solo in uptrend, SHORT solo in downtrend
+- [x] Conflict resolution: BUY + SHORT simultanei -> HOLD
+- [x] Loop live: LONG su Spot Demo, SHORT su Futures Demo (leva 1x, fail-fast)
+- [x] try/except su ogni create_order(), stato aggiornato solo dopo conferma
+- [x] No double-trade per ciclo (continue dopo stop-loss)
+- [x] Retraining automatico ogni 24h (entrambi i modelli)
+- [x] Persistenza modello su disco (model_buy.joblib + model_short.joblib)
+- [x] Persistenza stato con position_type (bot_state.json, backward compat)
+- [x] Notifiche Telegram (LONG/SHORT trade, stop loss, errori, retraining)
+- [x] Dashboard web con signal log dettagliato (action, reason, trend)
+- [x] Flag `--backtest` per skip training e usare modelli cached
 - [x] Deploy su VPS (Hostinger Game Panel 4)
 
 ---
 
-## Performance backtest (walk-forward, 342 giorni, B&H -3%)
+## Performance backtest (walk-forward LONG+SHORT, 342 giorni, B&H -9%)
 
 | Metrica | Valore |
 |---------|--------|
-| Return | +27.7% |
-| Sharpe | 1.25 |
-| Sortino | 3.06 |
-| Profit Factor | 1.83 |
-| Win Rate | 48.8% |
-| # Trade | 84 |
-| Max Drawdown | -12.1% |
-| Avg Trade | +0.32% |
+| Return | +35.0% |
+| Sharpe | 1.33 |
+| Sortino | 3.19 |
+| Profit Factor | 1.48 |
+| Win Rate | 47.5% |
+| # Trade | 177 |
+| Max Drawdown | -11.9% |
+| Avg Trade | +0.22% |
 | Avg Duration | 15h |
-| SQN | 1.64 |
+| SQN | 1.49 |
+| Exposure Time | 34.5% |
 
 ---
 
 ## Note importanti
 
-- Il bot usa **Binance Testnet** per gli ordini: nessun soldo reale viene toccato.
-- I dati OHLCV vengono scaricati dalla **Binance pubblica** (mercato reale).
-- Il modello viene salvato su disco con `joblib` e ricaricato se ha meno di `RETRAIN_HOURS` ore.
-- Lo stato della posizione (entry_price, entry_qty, entry_time) viene persistito in `bot_state.json`.
+- Il bot usa **Binance Demo Trading** per gli ordini: nessun soldo reale viene toccato.
+- I dati OHLCV vengono scaricati dalla **Binance pubblica** (mercato reale), con fallback su demo endpoint.
+- Due modelli separati: `model_buy.joblib` (LONG) e `model_short.joblib` (SHORT).
+- Lo stato include `position_type` ("long"/"short"/None) — critico per direzione stop-loss dopo restart.
 - `shuffle=False` nel train/test split e' fondamentale per time-series.
-- La commission e' impostata a `0.001` (0.1%) nel backtest, uguale a Binance spot.
-- Optuna best_params.json ha TTL 48h; cancellare per forzare ri-ottimizzazione.
-- Fold degeneri usano il modello del fold precedente come fallback.
-- `save_dashboard_data()` e' wrappato in try/except per non bloccare stop-loss in caso di errore I/O.
-- Errori di rete ccxt vengono ritentati fino a 3 volte con backoff (30s, 60s, 120s) prima di notificare Telegram.
-- `entry_price`/`save_state()` vengono salvati subito dopo `create_order()`, prima di Telegram/dashboard.
+- Commission 0.1% nel backtest, uguale a Binance.
+- Optuna cache: `best_params_buy.json` e `best_params_short.json` con TTL 48h.
+- Futures leverage forzato a 1x. Se `set_leverage(1)` fallisce, il bot non parte.
+- Spot e Futures hanno bilanci USDT separati. Il bot interroga l'exchange corretto per ogni posizione.
+- `_calc_pnl()` gestisce LONG (price - entry) e SHORT (entry - price) correttamente.
+- `save_dashboard_data()` include `signal_log` con action/reason per ogni ciclo (ultimi 50).
