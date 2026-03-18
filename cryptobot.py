@@ -107,14 +107,33 @@ WF_TEST_BARS    = 200         # candele per ogni finestra di test
 # 1. FETCH DATI
 # ─────────────────────────────────────────────
 
+_ohlcv_exchange = None  # cache globale per evitare load_markets() ogni ciclo
+
 def fetch_ohlcv(symbol=SYMBOL, timeframe=TIMEFRAME, limit=FETCH_LIMIT):
     """
     Scarica i dati OHLCV da Binance (endpoint pubblico, niente API key).
     Supporta paginazione per ottenere piu' di 1000 candele.
+    Usa istanza cached per evitare chiamate ripetute a exchangeInfo.
+    Fallback: se l'API pubblica fallisce, usa il demo endpoint.
     """
-    exchange = ccxt.binance({
-        "options": {"fetchMarkets": {"types": ["spot"]}},
-    })
+    global _ohlcv_exchange
+    if _ohlcv_exchange is None:
+        try:
+            _ohlcv_exchange = ccxt.binance({
+                "options": {"fetchMarkets": {"types": ["spot"]}},
+            })
+            _ohlcv_exchange.load_markets()
+        except Exception:
+            # Fallback: usa demo endpoint (stessi dati di mercato)
+            print("[WARN] API pubblica Binance non raggiungibile, uso demo endpoint")
+            _ohlcv_exchange = ccxt.binance({
+                "apiKey": TESTNET_API_KEY,
+                "secret": TESTNET_SECRET,
+                "options": {"defaultType": "spot", "fetchMarkets": {"types": ["spot"]}},
+            })
+            _ohlcv_exchange.enable_demo_trading(True)
+            _ohlcv_exchange.load_markets()
+    exchange = _ohlcv_exchange
     max_per_request = 1000
 
     if limit <= max_per_request:
