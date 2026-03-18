@@ -59,6 +59,8 @@ TRADE_SIZE      = 0.95        # % del capitale usata per ogni trade
 STOP_LOSS       = 0.02        # 2% stop loss — chiude posizione se la perdita supera questa soglia
 INITIAL_CASH    = 500         # capitale iniziale per il backtest (in USD)
 SLEEP_SECONDS   = 900         # secondi tra ogni ciclo del bot (15 min)
+MAX_RETRIES     = 3           # tentativi per errori di rete transitori
+RETRY_BACKOFF   = [30, 60, 120]  # secondi di attesa tra retry
 MIN_HOLD_BARS   = 5           # hold minimo 5h prima di SELL tecnico (= FUTURE_BARS, stop loss escluso)
 LOG_FILE        = "trades_log.csv"
 RETRAIN_HOURS   = 24            # riaddestra il modello ogni N ore
@@ -66,6 +68,10 @@ MODEL_FILE      = "model.joblib"
 STATE_FILE      = "bot_state.json"
 DASHBOARD_FILE  = "dashboard_data.json"
 PRICE_HISTORY_FILE = "price_history.json"
+
+TRANSIENT_ERRORS = (
+    ccxt.NetworkError,      # copre ExchangeNotAvailable, RequestTimeout, DDoSProtection
+)
 
 FEATURES = [
     "rsi", "macd", "macd_signal", "bb_width",
@@ -882,6 +888,7 @@ def run_bot(model):
         f"🛡 Stop loss: {STOP_LOSS:.0%} | Min confidenza: {MIN_PROBA:.0%}"
     )
 
+    consecutive_net_errors = 0
     while True:
         try:
             # --- Retraining periodico ---
@@ -969,6 +976,11 @@ def run_bot(model):
                     qty = int(btc * 1e6) / 1e6  # tronca a 6 decimali (vendi tutto)
                     pnl_usd = (price - entry_price) * qty
                     exchange.create_order(SYMBOL, "market", "sell", qty)
+                    # Salva stato SUBITO dopo l'ordine (prima di telegram/dashboard)
+                    entry_price = None
+                    entry_qty = None
+                    entry_time = None
+                    save_state(entry_price, entry_qty, entry_time)
                     print(f"  -> STOP LOSS: SELL {qty} BTC @ {price:.2f} "
                           f"(loss: {loss:.2%}, P&L: ${pnl_usd:+,.2f})")
                     log_trade("SELL(SL)", qty, price, "STOP_LOSS",
@@ -981,10 +993,6 @@ def run_bot(model):
                         f"📉 Loss: {loss:.2%}\n"
                         f"💸 P&amp;L: ${pnl_usd:+,.2f}"
                     )
-                    entry_price = None
-                    entry_qty = None
-                    entry_time = None
-                    save_state(entry_price, entry_qty, entry_time)
                     # Aggiorna dashboard subito dopo stop loss
                     try:
                         bal = exchange.fetch_balance()
@@ -1014,6 +1022,11 @@ def run_bot(model):
                     # BUY: entra long
                     qty = round((usdt * TRADE_SIZE) / price, 6)
                     exchange.create_order(SYMBOL, "market", "buy", qty)
+                    # Salva stato SUBITO dopo l'ordine (prima di telegram/dashboard)
+                    entry_price = price
+                    entry_qty = qty
+                    entry_time = datetime.now(timezone.utc)
+                    save_state(entry_price, entry_qty, entry_time)
                     print(f"  -> ORDER: BUY {qty} BTC @ {price:.2f} "
                           f"(BUY prob: {buy_proba:.0%})")
                     log_trade("BUY", qty, price, "BUY", buy_proba)
@@ -1024,10 +1037,6 @@ def run_bot(model):
                         f"🤖 Confidenza ML: {buy_proba:.0%}\n"
                         f"💵 Investito: ${qty * price:,.2f}"
                     )
-                    entry_price = price
-                    entry_qty = qty
-                    entry_time = datetime.now(timezone.utc)
-                    save_state(entry_price, entry_qty, entry_time)
                     # Aggiorna dashboard subito dopo BUY
                     try:
                         bal = exchange.fetch_balance()
@@ -1044,6 +1053,11 @@ def run_bot(model):
                 pnl_usd = (price - entry_price) * qty
                 pnl_pct = (price - entry_price) / entry_price
                 exchange.create_order(SYMBOL, "market", "sell", qty)
+                # Salva stato SUBITO dopo l'ordine (prima di telegram/dashboard)
+                entry_price = None
+                entry_qty = None
+                entry_time = None
+                save_state(entry_price, entry_qty, entry_time)
                 print(f"  -> ORDER: SELL(tech) {qty} BTC @ {price:.2f} "
                       f"(P&L: ${pnl_usd:+,.2f})")
                 log_trade("SELL", qty, price, "SELL_TECH", buy_proba, pnl_usd)
@@ -1054,10 +1068,6 @@ def run_bot(model):
                     f"💼 {qty} BTC @ ${price:,.2f}\n"
                     f"{pnl_icon} P&amp;L: {pnl_pct:+.2%} (${pnl_usd:+,.2f})"
                 )
-                entry_price = None
-                entry_qty = None
-                entry_time = None
-                save_state(entry_price, entry_qty, entry_time)
                 # Aggiorna dashboard subito dopo SELL
                 try:
                     bal = exchange.fetch_balance()
@@ -1070,6 +1080,25 @@ def run_bot(model):
             else:
                 print(f"  -> HOLD (nessuna azione)")
 
+            consecutive_net_errors = 0  # ciclo OK, reset contatore
+
+        except TRANSIENT_ERRORS as e:
+            consecutive_net_errors += 1
+            err_msg = f"{type(e).__name__}: {e}"
+            if consecutive_net_errors <= MAX_RETRIES:
+                wait = RETRY_BACKOFF[consecutive_net_errors - 1]
+                print(f"[RETRY {consecutive_net_errors}/{MAX_RETRIES}] {err_msg}")
+                print(f"  -> Riprovo tra {wait}s...")
+                time.sleep(wait)
+                continue  # riprova subito, senza aspettare SLEEP_SECONDS
+            else:
+                print(f"[ERRORE] {err_msg} (dopo {MAX_RETRIES} tentativi)")
+                send_telegram(
+                    f"🚨 <b>Errore di rete</b> (dopo {MAX_RETRIES} tentativi)\n"
+                    f"<code>{err_msg[:500]}</code>"
+                )
+                consecutive_net_errors = 0  # reset dopo notifica
+
         except Exception as e:
             err_msg = f"{type(e).__name__}: {e}"
             print(f"[ERRORE] {err_msg}")
@@ -1077,6 +1106,7 @@ def run_bot(model):
                 f"🚨 <b>Errore</b>\n"
                 f"<code>{err_msg[:500]}</code>"
             )
+            consecutive_net_errors = 0
 
         print(f"  -> Prossimo ciclo tra {SLEEP_SECONDS // 60} minuti...\n")
         time.sleep(SLEEP_SECONDS)
