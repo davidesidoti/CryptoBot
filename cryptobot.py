@@ -9,6 +9,7 @@ import os
 import csv
 import json
 import time
+import traceback
 from datetime import datetime, timezone
 import warnings
 import urllib.request
@@ -1537,27 +1538,48 @@ def run_bot(model_buy, model_short=None):
 
         except TRANSIENT_ERRORS as e:
             consecutive_net_errors += 1
+            tb_short = traceback.format_exc().strip().split("\n")
+            tb_last = "\n".join(tb_short[-4:]) if len(tb_short) >= 4 else "\n".join(tb_short)
+            err_class = " > ".join(
+                c.__name__ for c in type(e).__mro__ if c is not object
+            )
             err_msg = f"{type(e).__name__}: {e}"
+            ts = datetime.now().strftime("%H:%M:%S")
             if consecutive_net_errors <= MAX_RETRIES:
                 wait = RETRY_BACKOFF[consecutive_net_errors - 1]
-                print(f"[RETRY {consecutive_net_errors}/{MAX_RETRIES}] {err_msg}")
+                print(f"[RETRY {consecutive_net_errors}/{MAX_RETRIES}] {ts} {err_msg}")
                 print(f"  -> Riprovo tra {wait}s...")
                 time.sleep(wait)
                 continue
             else:
-                print(f"[ERRORE] {err_msg} (dopo {MAX_RETRIES} tentativi)")
+                print(f"[ERRORE] {ts} {err_msg} (dopo {MAX_RETRIES} tentativi)")
+                print(f"  Traceback:\n{traceback.format_exc()}")
                 send_telegram(
                     f"🚨 <b>Errore di rete</b> (dopo {MAX_RETRIES} tentativi)\n"
-                    f"<code>{err_msg[:500]}</code>"
+                    f"⏰ {ts}\n"
+                    f"🔗 <b>Tipo:</b> <code>{err_class}</code>\n"
+                    f"💬 <code>{err_msg[:300]}</code>\n"
+                    f"📋 <b>Traceback:</b>\n<code>{tb_last[:300]}</code>"
                 )
                 consecutive_net_errors = 0
 
         except Exception as e:
+            tb_short = traceback.format_exc().strip().split("\n")
+            tb_last = "\n".join(tb_short[-4:]) if len(tb_short) >= 4 else "\n".join(tb_short)
+            err_class = " > ".join(
+                c.__name__ for c in type(e).__mro__ if c is not object
+            )
             err_msg = f"{type(e).__name__}: {e}"
-            print(f"[ERRORE] {err_msg}")
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"[ERRORE] {ts} {err_msg}")
+            print(f"  Tipo: {err_class}")
+            print(f"  Traceback:\n{traceback.format_exc()}")
             send_telegram(
                 f"🚨 <b>Errore</b>\n"
-                f"<code>{err_msg[:500]}</code>"
+                f"⏰ {ts}\n"
+                f"🔗 <b>Tipo:</b> <code>{err_class}</code>\n"
+                f"💬 <code>{err_msg[:300]}</code>\n"
+                f"📋 <b>Traceback:</b>\n<code>{tb_last[:300]}</code>"
             )
             consecutive_net_errors = 0
 
