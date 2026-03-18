@@ -1472,13 +1472,46 @@ def run_bot(model_buy, model_short=None):
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Prova a caricare modelli recenti da disco (dual: BUY + SHORT)
+    import sys
+    backtest_only = "--backtest" in sys.argv
+
+    if backtest_only:
+        # === Modalita' backtest-only: usa modelli salvati, skip training ===
+        print("=== MODALITA' BACKTEST-ONLY ===\n")
+        model_buy, model_short = load_model()
+        if model_buy is None:
+            print("ERRORE: nessun modello salvato. Esegui prima il training completo.")
+            sys.exit(1)
+
+        print("=== Fase 1 - download dati ===")
+        df_raw = fetch_ohlcv()
+        print(f"Scaricate {len(df_raw)} candele per {SYMBOL} ({TIMEFRAME})")
+
+        print("\n=== Fase 2 - feature engineering ===")
+        df_feat = build_features(df_raw)
+        print(f"Dataset: {len(df_feat)} righe, {len(FEATURES)} features")
+
+        # Walk-forward per generare predizioni out-of-sample (usa params cached)
+        best_params_buy = optimize_hyperparams(df_feat, target_label=1, cache_file=OPTUNA_BUY_FILE)
+        best_params_short = None
+        if ENABLE_SHORT:
+            best_params_short = optimize_hyperparams(df_feat, target_label=-1, cache_file=OPTUNA_SHORT_FILE)
+
+        print("\n=== Fase 3 - walk-forward (solo predizioni, params cached) ===")
+        model_buy, model_short, wf_predictions = walk_forward_train(
+            df_feat, best_params_buy=best_params_buy, best_params_short=best_params_short
+        )
+
+        print("\n=== Fase 4 - backtest ===")
+        backtest(df_raw, df_feat, model_buy, model_short, pred_series=wf_predictions)
+        sys.exit(0)
+
+    # === Modalita' normale: training completo + (opzionale) bot live ===
     model_buy, model_short = load_model()
 
     if model_buy is not None:
         print("Modello caricato da disco - skip training.")
         print(f"Per forzare il retraining, cancella {MODEL_BUY_FILE} e {MODEL_SHORT_FILE}\n")
-        # Genera price_history.json per la dashboard anche senza training
         try:
             df_raw = fetch_ohlcv()
             save_price_history(df_raw)
