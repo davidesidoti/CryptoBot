@@ -989,37 +989,73 @@ def load_state():
 
 
 def save_dashboard_data(price, buy_proba, signal_str, usdt, btc,
-                        entry_price, entry_qty, features_row):
+                        entry_price, entry_qty, features_row,
+                        short_proba=0.0, position_type=None,
+                        action_taken="", reason=""):
     """Salva snapshot del ciclo corrente per la dashboard web."""
-    # Accumula ultimi 20 prezzi per sparkline
+    # Accumula ultimi 20 prezzi per sparkline e ultimi 50 signal log
     sparkline = []
+    signal_log = []
     if os.path.isfile(DASHBOARD_FILE):
         try:
             with open(DASHBOARD_FILE) as f:
                 old = json.load(f)
             sparkline = old.get("sparkline", [])
+            signal_log = old.get("signal_log", [])
         except (json.JSONDecodeError, KeyError):
             pass
     sparkline.append(round(price, 2))
     sparkline = sparkline[-20:]
 
+    # Calcola P&L correttamente per LONG e SHORT
+    pnl_pct = None
+    pnl_usd = None
+    if entry_price and position_type == "short":
+        pnl_pct = round((entry_price - price) / entry_price, 4)
+        pnl_usd = round((entry_price - price) * (entry_qty or 0), 2)
+    elif entry_price:
+        pnl_pct = round((price - entry_price) / entry_price, 4)
+        pnl_usd = round((price - entry_price) * (entry_qty or 0), 2)
+
+    # Determina trend
+    trend_up = features_row.get("trend_up") if features_row else None
+
+    # Aggiungi entry al signal log
+    signal_log.append({
+        "ts": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+        "price": round(price, 2),
+        "buy_p": round(buy_proba * 100, 1),
+        "short_p": round(short_proba * 100, 1),
+        "signal": signal_str,
+        "action": action_taken or "HOLD",
+        "reason": reason,
+        "trend": "UP" if trend_up == 1 else ("DOWN" if trend_up == 0 else "?"),
+        "pos": position_type.upper() if position_type else "FLAT",
+    })
+    signal_log = signal_log[-50:]
+
     data = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "price": price,
         "buy_proba": round(buy_proba, 4),
+        "short_proba": round(short_proba, 4),
         "signal": signal_str,
+        "position_type": position_type,
         "usdt": round(usdt, 2),
         "btc": round(btc, 8),
         "entry_price": entry_price,
         "entry_qty": entry_qty,
-        "pnl_pct": round((price - entry_price) / entry_price, 4) if entry_price else None,
-        "pnl_usd": round((price - entry_price) * (entry_qty or 0), 2) if entry_price else None,
+        "pnl_pct": pnl_pct,
+        "pnl_usd": pnl_usd,
         "features": {k: round(v, 4) if isinstance(v, float) else v
                      for k, v in features_row.items()},
         "sparkline": sparkline,
+        "signal_log": signal_log,
         "sleep_seconds": SLEEP_SECONDS,
         "stop_loss": STOP_LOSS,
         "min_proba": MIN_PROBA,
+        "short_min_proba": SHORT_MIN_PROBA if ENABLE_SHORT else None,
+        "trend_up": trend_up,
     }
     with open(DASHBOARD_FILE, "w") as f:
         json.dump(data, f, indent=2, default=str)
@@ -1242,15 +1278,10 @@ def run_bot(model_buy, model_short=None):
                 f"USDT: {usdt:.2f}"
             )
 
-            # --- Dashboard ---
-            try:
-                save_dashboard_data(
-                    price, buy_proba, signal_str, usdt, btc,
-                    entry_price, entry_qty,
-                    df_feat[FEATURES].iloc[-1].to_dict()
-                )
-            except Exception as e:
-                print(f"[DASHBOARD] Errore: {e}")
+            # --- Variabili per tracking azione/motivo (aggiornate sotto) ---
+            dash_action = "HOLD"
+            dash_reason = ""
+            features_dict = df_feat[FEATURES].iloc[-1].to_dict()
 
             # --- Notifica stato periodica ---
             if (time.time() - last_status) >= STATUS_INTERVAL:
@@ -1298,6 +1329,8 @@ def run_bot(model_buy, model_short=None):
                         print(f"  [ERRORE] Stop loss LONG fallito: {e}")
                         send_telegram(f"🚨 <b>Stop Loss LONG fallito</b>\n<code>{e}</code>")
                         continue
+                    dash_action = "STOP_LOSS_LONG"
+                    dash_reason = f"Loss {loss_pct:.2%} <= -{STOP_LOSS:.0%}"
                     entry_price = None; entry_qty = None; entry_time = None; position_type = None
                     save_state(entry_price, entry_qty, entry_time, position_type)
                     print(f"  -> STOP LOSS LONG: SELL {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
@@ -1308,6 +1341,12 @@ def run_bot(model_buy, model_short=None):
                         f"🔴 SELL {qty} BTC @ ${price:,.2f}\n"
                         f"📉 Loss: {loss_pct:.2%} | P&amp;L: ${pnl_usd:+,.2f}"
                     )
+                    try:
+                        save_dashboard_data(price, buy_proba, signal_str, usdt, btc,
+                            None, None, features_dict, short_proba, None,
+                            dash_action, dash_reason)
+                    except Exception:
+                        pass
                     time.sleep(SLEEP_SECONDS)
                     continue  # NON aprire nuove posizioni nello stesso ciclo
 
@@ -1323,6 +1362,8 @@ def run_bot(model_buy, model_short=None):
                         print(f"  [ERRORE] Stop loss SHORT fallito: {e}")
                         send_telegram(f"🚨 <b>Stop Loss SHORT fallito</b>\n<code>{e}</code>")
                         continue
+                    dash_action = "STOP_LOSS_SHORT"
+                    dash_reason = f"Loss {loss_pct:.2%} <= -{SHORT_STOP_LOSS:.0%}"
                     entry_price = None; entry_qty = None; entry_time = None; position_type = None
                     save_state(entry_price, entry_qty, entry_time, position_type)
                     print(f"  -> STOP LOSS SHORT: BUY {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
@@ -1333,6 +1374,12 @@ def run_bot(model_buy, model_short=None):
                         f"🟢 BUY(cover) {qty} BTC @ ${price:,.2f}\n"
                         f"📈 Loss: {loss_pct:.2%} | P&amp;L: ${pnl_usd:+,.2f}"
                     )
+                    try:
+                        save_dashboard_data(price, buy_proba, signal_str, usdt, btc,
+                            None, None, features_dict, short_proba, None,
+                            dash_action, dash_reason)
+                    except Exception:
+                        pass
                     time.sleep(SLEEP_SECONDS)
                     continue
 
@@ -1343,12 +1390,14 @@ def run_bot(model_buy, model_short=None):
                 hours_held = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
                 if hours_held < MIN_HOLD_BARS:
                     sell_signal = False
+                    dash_reason = f"CLOSE soppresso: hold {hours_held:.1f}h < {MIN_HOLD_BARS}h min"
                     print(f"  -> CLOSE LONG soppresso: hold {hours_held:.1f}h < {MIN_HOLD_BARS}h")
 
             if cover_signal and position_type == "short" and entry_time:
                 hours_held = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
                 if hours_held < SHORT_MIN_HOLD:
                     cover_signal = False
+                    dash_reason = f"COVER soppresso: hold {hours_held:.1f}h < {SHORT_MIN_HOLD}h min"
                     print(f"  -> CLOSE SHORT soppresso: hold {hours_held:.1f}h < {SHORT_MIN_HOLD}h")
 
             # ============================================
@@ -1358,6 +1407,8 @@ def run_bot(model_buy, model_short=None):
             if buy_signal and usdt > 10 and not position_type:
                 trend_ok = df_feat["trend_up"].iloc[-1] == 1
                 if not trend_ok:
+                    dash_action = "BUY_BLOCKED"
+                    dash_reason = f"Trend DOWN (prezzo < EMA20), BUY {buy_proba:.0%} bloccato"
                     print(f"  -> Trend ribassista (prezzo < EMA20), BUY bloccato.")
                 else:
                     qty = round((usdt * TRADE_SIZE) / price, 6)
@@ -1367,6 +1418,8 @@ def run_bot(model_buy, model_short=None):
                         print(f"  [ERRORE] BUY fallito: {e}")
                         send_telegram(f"🚨 <b>BUY fallito</b>\n<code>{e}</code>")
                         continue
+                    dash_action = "OPEN_LONG"
+                    dash_reason = f"BUY {buy_proba:.0%} >= {MIN_PROBA:.0%}, trend UP"
                     entry_price = price; entry_qty = qty
                     entry_time = datetime.now(timezone.utc); position_type = "long"
                     save_state(entry_price, entry_qty, entry_time, position_type)
@@ -1383,6 +1436,8 @@ def run_bot(model_buy, model_short=None):
             elif short_signal and short_enabled and usdt > 10 and not position_type:
                 trend_down = df_feat["trend_up"].iloc[-1] == 0
                 if not trend_down:
+                    dash_action = "SHORT_BLOCKED"
+                    dash_reason = f"Trend UP (prezzo > EMA20), SHORT {short_proba:.0%} bloccato"
                     print(f"  -> Trend rialzista (prezzo > EMA20), SHORT bloccato.")
                 else:
                     qty = round((usdt * SHORT_TRADE_SIZE) / price, 6)
@@ -1392,6 +1447,8 @@ def run_bot(model_buy, model_short=None):
                         print(f"  [ERRORE] SHORT fallito: {e}")
                         send_telegram(f"🚨 <b>SHORT fallito</b>\n<code>{e}</code>")
                         continue
+                    dash_action = "OPEN_SHORT"
+                    dash_reason = f"SHORT {short_proba:.0%} >= {SHORT_MIN_PROBA:.0%}, trend DOWN"
                     entry_price = price; entry_qty = qty
                     entry_time = datetime.now(timezone.utc); position_type = "short"
                     save_state(entry_price, entry_qty, entry_time, position_type)
@@ -1418,6 +1475,8 @@ def run_bot(model_buy, model_short=None):
                     print(f"  [ERRORE] CLOSE LONG fallito: {e}")
                     send_telegram(f"🚨 <b>CLOSE LONG fallito</b>\n<code>{e}</code>")
                     continue
+                dash_action = "CLOSE_LONG"
+                dash_reason = f"SELL tecnico (RSI/MACD/EMA)"
                 entry_price = None; entry_qty = None; entry_time = None; position_type = None
                 save_state(entry_price, entry_qty, entry_time, position_type)
                 print(f"  -> ORDER: CLOSE LONG {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
@@ -1439,6 +1498,8 @@ def run_bot(model_buy, model_short=None):
                     print(f"  [ERRORE] CLOSE SHORT fallito: {e}")
                     send_telegram(f"🚨 <b>CLOSE SHORT fallito</b>\n<code>{e}</code>")
                     continue
+                dash_action = "CLOSE_SHORT"
+                dash_reason = f"COVER tecnico (RSI/MACD/EMA)"
                 entry_price = None; entry_qty = None; entry_time = None; position_type = None
                 save_state(entry_price, entry_qty, entry_time, position_type)
                 print(f"  -> ORDER: CLOSE SHORT {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
@@ -1452,7 +1513,25 @@ def run_bot(model_buy, model_short=None):
                 )
 
             else:
+                # Determina motivo HOLD
+                if position_type:
+                    dash_reason = f"In posizione {position_type.upper()}, attesa segnale chiusura"
+                elif buy_proba < MIN_PROBA and short_proba < SHORT_MIN_PROBA:
+                    dash_reason = f"Confidenza bassa (BUY {buy_proba:.0%} < {MIN_PROBA:.0%}, SHORT {short_proba:.0%} < {SHORT_MIN_PROBA:.0%})"
+                else:
+                    dash_reason = "Nessun segnale attivo"
                 print(f"  -> HOLD (nessuna azione)")
+
+            # --- Dashboard save (fine ciclo, con action/reason) ---
+            try:
+                save_dashboard_data(
+                    price, buy_proba, signal_str, usdt, btc,
+                    entry_price, entry_qty, features_dict,
+                    short_proba, position_type,
+                    dash_action, dash_reason
+                )
+            except Exception as e:
+                print(f"[DASHBOARD] Errore: {e}")
 
             consecutive_net_errors = 0
 

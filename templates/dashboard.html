@@ -164,7 +164,67 @@
         </div>
     </div>
 
-    <!-- Activity Feed -->
+    <!-- Signal Details Panel -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+        <!-- Current Decision -->
+        <div class="card p-4">
+            <div class="text-sm font-medium text-gray-300 mb-3">Decisione Corrente</div>
+            <div id="decision-panel" class="space-y-3">
+                <div class="flex items-center justify-between">
+                    <span class="text-xs text-gray-400">Azione</span>
+                    <span id="dec-action" class="text-sm font-bold text-white">—</span>
+                </div>
+                <div class="text-xs text-gray-400 leading-relaxed" id="dec-reason">—</div>
+                <div class="border-t border-gray-700 pt-2 space-y-1.5">
+                    <div class="flex items-center justify-between">
+                        <span class="text-xs text-gray-400">Trend EMA20</span>
+                        <span id="dec-trend" class="text-xs font-medium">—</span>
+                    </div>
+                    <div class="flex items-center justify-between">
+                        <span class="text-xs text-gray-400">Posizione</span>
+                        <span id="dec-pos" class="text-xs font-medium text-gray-300">—</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Dual Model Confidence -->
+        <div class="card p-4">
+            <div class="text-sm font-medium text-gray-300 mb-3">Modelli ML</div>
+            <div class="space-y-4">
+                <div>
+                    <div class="flex items-center justify-between mb-1">
+                        <span class="text-xs text-gray-400">BUY (Long)</span>
+                        <span id="ml-buy-pct" class="text-sm font-bold text-[#00e396]">—</span>
+                    </div>
+                    <div class="w-full bg-gray-700 rounded-full h-2">
+                        <div id="ml-buy-bar" class="h-2 rounded-full bg-[#00e396] transition-all duration-500" style="width:0%"></div>
+                    </div>
+                    <div class="text-[10px] text-gray-500 mt-0.5">Soglia: <span id="ml-buy-thresh">55%</span></div>
+                </div>
+                <div>
+                    <div class="flex items-center justify-between mb-1">
+                        <span class="text-xs text-gray-400">SHORT</span>
+                        <span id="ml-short-pct" class="text-sm font-bold text-[#ff4560]">—</span>
+                    </div>
+                    <div class="w-full bg-gray-700 rounded-full h-2">
+                        <div id="ml-short-bar" class="h-2 rounded-full bg-[#ff4560] transition-all duration-500" style="width:0%"></div>
+                    </div>
+                    <div class="text-[10px] text-gray-500 mt-0.5">Soglia: <span id="ml-short-thresh">60%</span></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Signal Log (scrollable) -->
+        <div class="card p-4">
+            <div class="text-sm font-medium text-gray-300 mb-3">Signal Log</div>
+            <div id="signal-log" class="max-h-52 overflow-y-auto space-y-1 text-xs font-mono">
+                <div class="text-gray-500 py-2 text-center">Caricamento...</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Activity Feed (trades) -->
     <div class="card p-4 mb-6">
         <div class="text-sm font-medium text-gray-300 mb-3">Attivita' Recente</div>
         <div id="activity-feed" class="max-h-52 overflow-y-auto space-y-1.5">
@@ -423,6 +483,74 @@
 
             // Features radar
             if (d.features) updateFeaturesChart(d.features);
+
+            // --- Signal Details Panel ---
+            // Decision panel
+            const lastLog = d.signal_log && d.signal_log.length > 0
+                ? d.signal_log[d.signal_log.length - 1] : null;
+            if (lastLog) {
+                const actEl = document.getElementById('dec-action');
+                const actionColors = {
+                    'HOLD': 'text-gray-400', 'BUY_BLOCKED': 'text-[#feb019]',
+                    'SHORT_BLOCKED': 'text-[#feb019]', 'OPEN_LONG': 'text-[#00e396]',
+                    'OPEN_SHORT': 'text-[#ff4560]', 'CLOSE_LONG': 'text-[#ff4560]',
+                    'CLOSE_SHORT': 'text-[#00e396]', 'STOP_LOSS_LONG': 'text-[#ff4560]',
+                    'STOP_LOSS_SHORT': 'text-[#ff4560]',
+                };
+                actEl.textContent = lastLog.action;
+                actEl.className = 'text-sm font-bold ' + (actionColors[lastLog.action] || 'text-white');
+                document.getElementById('dec-reason').textContent = lastLog.reason || '—';
+
+                const trendEl = document.getElementById('dec-trend');
+                trendEl.textContent = lastLog.trend === 'UP' ? '▲ Uptrend' : '▼ Downtrend';
+                trendEl.className = 'text-xs font-medium ' +
+                    (lastLog.trend === 'UP' ? 'text-[#00e396]' : 'text-[#ff4560]');
+
+                const posEl = document.getElementById('dec-pos');
+                if (lastLog.pos === 'FLAT') {
+                    posEl.textContent = '— Nessuna';
+                    posEl.className = 'text-xs font-medium text-gray-400';
+                } else {
+                    posEl.textContent = lastLog.pos === 'LONG' ? '🟢 LONG' : '🔴 SHORT';
+                    posEl.className = 'text-xs font-medium ' +
+                        (lastLog.pos === 'LONG' ? 'text-[#00e396]' : 'text-[#ff4560]');
+                }
+            }
+
+            // Dual model bars
+            const buyPct = d.buy_proba * 100;
+            const shortPct = (d.short_proba || 0) * 100;
+            document.getElementById('ml-buy-pct').textContent = buyPct.toFixed(0) + '%';
+            document.getElementById('ml-buy-bar').style.width = buyPct + '%';
+            document.getElementById('ml-buy-bar').style.backgroundColor =
+                buyPct >= (d.min_proba || 0.55) * 100 ? '#00e396' : '#374151';
+            document.getElementById('ml-short-pct').textContent = shortPct.toFixed(0) + '%';
+            document.getElementById('ml-short-bar').style.width = shortPct + '%';
+            document.getElementById('ml-short-bar').style.backgroundColor =
+                shortPct >= (d.short_min_proba || 0.60) * 100 ? '#ff4560' : '#374151';
+            if (d.min_proba) document.getElementById('ml-buy-thresh').textContent = (d.min_proba * 100).toFixed(0) + '%';
+            if (d.short_min_proba) document.getElementById('ml-short-thresh').textContent = (d.short_min_proba * 100).toFixed(0) + '%';
+
+            // Signal log (scrollable list)
+            if (d.signal_log && d.signal_log.length > 0) {
+                const logEl = document.getElementById('signal-log');
+                const logHtml = d.signal_log.slice().reverse().map(s => {
+                    const actColor = s.action.includes('LONG') || s.action === 'OPEN_LONG' ? '#00e396' :
+                                     s.action.includes('SHORT') || s.action === 'OPEN_SHORT' ? '#ff4560' :
+                                     s.action.includes('BLOCKED') ? '#feb019' :
+                                     s.action.includes('STOP') ? '#ff4560' : '#6b7280';
+                    const trendIcon = s.trend === 'UP' ? '<span class="text-[#00e396]">▲</span>' :
+                                      '<span class="text-[#ff4560]">▼</span>';
+                    return `<div class="flex items-center gap-2 p-1.5 rounded bg-gray-800/40 hover:bg-gray-800/70">
+                        <span class="text-gray-500 w-14 shrink-0">${s.ts}</span>
+                        ${trendIcon}
+                        <span class="text-gray-300">$${s.price.toLocaleString()}</span>
+                        <span style="color:${actColor}" class="font-medium shrink-0">${s.action}</span>
+                        <span class="text-gray-500 truncate ml-auto" title="${s.reason}">${s.reason}</span>
+                    </div>`;
+                }).join('');
+                logEl.innerHTML = logHtml;
+            }
 
         } catch (e) {
             console.error('Status update error:', e);
