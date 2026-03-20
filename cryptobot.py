@@ -83,6 +83,7 @@ MODEL_SHORT_FILE   = "model_short.joblib"
 
 TRANSIENT_ERRORS = (
     ccxt.NetworkError,      # copre ExchangeNotAvailable, RequestTimeout, DDoSProtection
+    ccxt.InvalidNonce,      # clock drift temporaneo VPS vs Binance
 )
 
 FEATURES = [
@@ -880,6 +881,7 @@ def get_testnet_exchange(exchange_type="spot"):
             "secret": TESTNET_SECRET,
             "options": {
                 "defaultType": "future",
+                "recvWindow": 10000,
             },
         })
         exchange.enable_demo_trading(True)
@@ -901,6 +903,7 @@ def get_testnet_exchange(exchange_type="spot"):
             "options": {
                 "defaultType": "spot",
                 "fetchMarkets": {"types": ["spot"]},
+                "recvWindow": 10000,
             },
         })
         exchange.enable_demo_trading(True)
