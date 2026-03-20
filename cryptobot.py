@@ -882,6 +882,7 @@ def get_testnet_exchange(exchange_type="spot"):
             "options": {
                 "defaultType": "future",
                 "recvWindow": 10000,
+                "adjustForTimeDifference": True,
             },
         })
         exchange.enable_demo_trading(True)
@@ -904,6 +905,7 @@ def get_testnet_exchange(exchange_type="spot"):
                 "defaultType": "spot",
                 "fetchMarkets": {"types": ["spot"]},
                 "recvWindow": 10000,
+                "adjustForTimeDifference": True,
             },
         })
         exchange.enable_demo_trading(True)
