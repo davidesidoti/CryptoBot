@@ -9,6 +9,7 @@ import os
 import csv
 import json
 import time
+import traceback
 from datetime import datetime, timezone
 import warnings
 import urllib.request
@@ -56,7 +57,9 @@ FUTURE_BARS     = 5           # quante candele in avanti per calcolare il label
 SIGNAL_THRESH   = 0.007       # 0.7% di movimento minimo per generare segnale
 MIN_PROBA       = 0.55        # confidenza minima per eseguire un ordine
 TRADE_SIZE      = 0.95        # % del capitale usata per ogni trade
-STOP_LOSS       = 0.02        # 2% stop loss — chiude posizione se la perdita supera questa soglia
+STOP_LOSS       = 0.02        # 2% stop loss fisso (prima che trailing si attivi)
+TRAIL_ATR_MULT  = 3.0         # trailing stop = ATR * questo moltiplicatore
+TRAIL_ACTIVATE  = 0.01        # trailing si attiva solo dopo +1% di profitto
 INITIAL_CASH    = 500         # capitale iniziale per il backtest (in USD)
 SLEEP_SECONDS   = 900         # secondi tra ogni ciclo del bot (15 min)
 MAX_RETRIES     = 3           # tentativi per errori di rete transitori
@@ -70,11 +73,12 @@ DASHBOARD_FILE  = "dashboard_data.json"
 PRICE_HISTORY_FILE = "price_history.json"
 
 # SHORT parameters
-SHORT_STOP_LOSS    = 0.02    # 2% stop loss per SHORT
-SHORT_MIN_PROBA    = 0.60    # soglia piu' alta (SHORT piu' selettivo)
+SHORT_STOP_LOSS    = 0.02    # 2% stop loss per SHORT (iniziale, poi trailing)
+SHORT_MIN_PROBA    = 0.65    # soglia alta — SHORT solo con alta confidenza
 SHORT_TRADE_SIZE   = 0.70    # 70% capitale (meno aggressivo del LONG 95%)
 SHORT_MIN_HOLD     = 3       # hold minimo 3h (bear moves piu' veloci)
 ENABLE_SHORT       = True    # flag per abilitare/disabilitare SHORT
+SHORT_ADX_MIN      = 20      # ADX minimo per aprire SHORT (richiede trend forte)
 
 # Model files (dual model)
 MODEL_BUY_FILE     = "model_buy.joblib"
@@ -82,6 +86,7 @@ MODEL_SHORT_FILE   = "model_short.joblib"
 
 TRANSIENT_ERRORS = (
     ccxt.NetworkError,      # copre ExchangeNotAvailable, RequestTimeout, DDoSProtection
+    ccxt.InvalidNonce,      # clock drift temporaneo VPS vs Binance
 )
 
 FEATURES = [
@@ -96,7 +101,9 @@ FEATURES = [
     # Regime / volatilita'
     "atr_ratio", "vol_regime",
     # SHORT-specific
-    "trend_down", "macd_hist"
+    "trend_down", "macd_hist",
+    # 15m sub-hourly features (early entry detection)
+    "rsi_15m", "macd_15m", "macd_hist_15m", "mom_15m", "vol_spike_15m"
 ]
 
 # Walk-forward validation
@@ -181,13 +188,15 @@ def fetch_ohlcv(symbol=SYMBOL, timeframe=TIMEFRAME, limit=FETCH_LIMIT):
 # 2. FEATURE ENGINEERING + LABEL
 # ─────────────────────────────────────────────
 
-def build_features(df):
+def build_features(df, df_15m=None):
     """
     Aggiunge indicatori tecnici e calcola il label:
       +1  = BUY  (prezzo sale > soglia dinamica ATR nelle prossime FUTURE_BARS candele)
       -1  = SELL (prezzo scende)
        0  = HOLD
     Include feature multi-timeframe (4h, 1d) resamplandole dal dataset 1h.
+    Include feature 15m sub-hourly per early entry detection.
+    Se df_15m non fornito, lo scarica automaticamente da Binance.
     """
     df = df.copy()
 
@@ -264,6 +273,46 @@ def build_features(df):
     # === SHORT-specific features ===
     df["trend_down"] = (df["close"] < df["ema_20"]).astype(int)  # inverso di trend_up
     df["macd_hist"]  = df["macd"] - df["macd_signal"]            # MACD histogram esplicito
+
+    # === Feature 15m sub-hourly (early entry detection) ===
+    # Se non fornito, scarica candele 15m da Binance (4x le candele 1h)
+    if df_15m is None:
+        try:
+            n_15m = min(len(df) * 4, 10000)  # 4 candele 15m per ogni 1h
+            df_15m = fetch_ohlcv(symbol=SYMBOL, timeframe="15m", limit=n_15m)
+        except Exception as e:
+            print(f"[WARN] Fetch 15m fallito ({e}), uso NaN per features 15m")
+            df_15m = None
+
+    _15m_neutral = {"rsi_15m": 50.0, "macd_15m": 0.0, "macd_hist_15m": 0.0,
+                    "mom_15m": 0.0, "vol_spike_15m": 1.0}
+
+    if df_15m is not None and len(df_15m) > 20:
+        # Calcola indicatori su candele 15m
+        df_15m = df_15m.copy()
+        df_15m["rsi_15m"]      = ta.rsi(df_15m["close"], length=14)
+        macd_15m_df            = ta.macd(df_15m["close"])
+        df_15m["macd_15m"]     = macd_15m_df["MACD_12_26_9"]
+        df_15m["macd_sig_15m"] = macd_15m_df["MACDs_12_26_9"]
+        df_15m["macd_hist_15m"] = df_15m["macd_15m"] - df_15m["macd_sig_15m"]
+        # Momentum: variazione % nelle ultime 4 candele 15m (~1h granulare)
+        df_15m["mom_15m"]      = df_15m["close"].pct_change(4)
+        # Volume spike: rapporto volume corrente vs media 20 periodi
+        vol_ma_15m             = df_15m["volume"].rolling(20).mean()
+        df_15m["vol_spike_15m"] = df_15m["volume"] / vol_ma_15m
+
+        # Resample a 1h: prendi l'ultimo valore 15m di ogni ora (il piu' recente)
+        cols_15m = list(_15m_neutral.keys())
+        df_15m_hourly = df_15m[cols_15m].resample("1h").last()
+        for col in cols_15m:
+            df[col] = df_15m_hourly[col].reindex(df.index, method="ffill")
+        # Riempi NaN con valori neutri (righe 1h prima dell'inizio dei dati 15m)
+        for col, neutral in _15m_neutral.items():
+            df[col] = df[col].fillna(neutral)
+    else:
+        # Fallback: valori neutri (no signal = nessun effetto sul modello)
+        for col, neutral in _15m_neutral.items():
+            df[col] = neutral
 
     # === Target dinamico (soglia basata su ATR) ===
     # Usa ATR% come soglia: se mercato volatile, servono movimenti piu' grandi
@@ -726,6 +775,12 @@ def backtest(df_raw, df_feat, model_buy, model_short=None, pred_series=None, tes
 
     # Filtro trend: blocca BUY quando prezzo < EMA20, blocca SHORT quando prezzo > EMA20
     trend_up = df_feat.loc[feat_index, "trend_up"]
+    # ATR per trailing stop (in unita' prezzo)
+    atr_series = df_feat.loc[feat_index, "atr"]
+    # 15m momentum per filtro conferma ingresso
+    mom_15m_series = df_feat.loc[feat_index, "mom_15m"]
+    # ADX per filtro SHORT
+    adx_series = df_feat.loc[feat_index, "adx"]
 
     class MLStrategy(Strategy):
         def init(self):
@@ -737,42 +792,92 @@ def backtest(df_raw, df_feat, model_buy, model_short=None, pred_series=None, tes
                 lambda: trend_up.reindex(raw_aligned.index).fillna(0).values,
                 name="Trend"
             )
+            self.atr = self.I(
+                lambda: atr_series.reindex(raw_aligned.index).fillna(0).values,
+                name="ATR"
+            )
+            self.mom_15m = self.I(
+                lambda: mom_15m_series.reindex(raw_aligned.index).fillna(0).values,
+                name="Mom15m"
+            )
+            self.adx = self.I(
+                lambda: adx_series.reindex(raw_aligned.index).fillna(0).values,
+                name="ADX"
+            )
             self.entry_price = None
+            self.trail_stop = None
             self.bars_held = 0
 
         def next(self):
             sig = self.signal[-1]
             price = self.data.Close[-1]
             trend_ok = self.trend[-1] == 1
+            cur_atr = self.atr[-1] / price_divisor if price_divisor > 1 else self.atr[-1]
 
-            # Stop loss LONG: chiudi se la perdita supera STOP_LOSS (SEMPRE attivo)
+            # --- Stop loss / Trailing stop LONG ---
             if self.position.is_long and self.entry_price:
                 self.bars_held += 1
-                loss = (price - self.entry_price) / self.entry_price
-                if loss <= -STOP_LOSS:
-                    self.position.close()
-                    self._reset()
-                    return
+                pnl_pct = (price - self.entry_price) / self.entry_price
+                if pnl_pct >= TRAIL_ACTIVATE:
+                    # In profitto: attiva trailing stop (ATR-based)
+                    new_trail = price - cur_atr * TRAIL_ATR_MULT
+                    if self.trail_stop is None:
+                        self.trail_stop = max(new_trail, self.entry_price)  # almeno breakeven
+                    else:
+                        self.trail_stop = max(self.trail_stop, new_trail)
+                    if price <= self.trail_stop:
+                        self.position.close()
+                        self._reset()
+                        return
+                else:
+                    # Non ancora in profitto: stop loss fisso classico
+                    if pnl_pct <= -STOP_LOSS:
+                        self.position.close()
+                        self._reset()
+                        return
 
-            # Stop loss SHORT: chiudi se prezzo sale oltre SHORT_STOP_LOSS (SEMPRE attivo)
+            # --- Stop loss / Trailing stop SHORT ---
             if self.position.is_short and self.entry_price:
                 self.bars_held += 1
-                loss = (self.entry_price - price) / self.entry_price  # invertito
-                if loss <= -SHORT_STOP_LOSS:
-                    self.position.close()
-                    self._reset()
-                    return
+                pnl_pct = (self.entry_price - price) / self.entry_price
+                if pnl_pct >= TRAIL_ACTIVATE:
+                    # In profitto: attiva trailing stop (ATR-based)
+                    new_trail = price + cur_atr * TRAIL_ATR_MULT
+                    if self.trail_stop is None:
+                        self.trail_stop = min(new_trail, self.entry_price)  # almeno breakeven
+                    else:
+                        self.trail_stop = min(self.trail_stop, new_trail)
+                    if price >= self.trail_stop:
+                        self.position.close()
+                        self._reset()
+                        return
+                else:
+                    # Non ancora in profitto: stop loss fisso classico
+                    if pnl_pct <= -SHORT_STOP_LOSS:
+                        self.position.close()
+                        self._reset()
+                        return
 
-            # OPEN LONG: sig == +1, flat, trend up
+            # OPEN LONG: sig == +1, flat, trend up, 15m momentum positivo (se disponibile)
             if sig == 1 and not self.position and trend_ok:
+                m15 = self.mom_15m[-1]
+                if m15 != 0 and m15 < 0:
+                    return  # momentum 15m reale e negativo → skip (impulso esaurito)
                 self.buy(size=TRADE_SIZE)
                 self.entry_price = price
+                self.trail_stop = None
                 self.bars_held = 0
 
-            # OPEN SHORT: sig == -1, flat, trend down
+            # OPEN SHORT: sig == -1, flat, trend down, 15m momentum negativo (se disponibile), ADX forte
             elif sig == -1 and not self.position and not trend_ok:
+                m15 = self.mom_15m[-1]
+                if m15 != 0 and m15 > 0:
+                    return  # momentum 15m reale e positivo → skip (impulso rialzista)
+                if self.adx[-1] < SHORT_ADX_MIN:
+                    return  # trend troppo debole per SHORT
                 self.sell(size=SHORT_TRADE_SIZE)
                 self.entry_price = price
+                self.trail_stop = None
                 self.bars_held = 0
 
             # CLOSE LONG: sig == -2, hold minimo rispettato
@@ -791,6 +896,7 @@ def backtest(df_raw, df_feat, model_buy, model_short=None, pred_series=None, tes
 
         def _reset(self):
             self.entry_price = None
+            self.trail_stop = None
             self.bars_held = 0
 
     # backtesting.py richiede colonne con la prima lettera maiuscola
@@ -879,6 +985,8 @@ def get_testnet_exchange(exchange_type="spot"):
             "secret": TESTNET_SECRET,
             "options": {
                 "defaultType": "future",
+                "recvWindow": 10000,
+                "adjustForTimeDifference": True,
             },
         })
         exchange.enable_demo_trading(True)
@@ -900,6 +1008,8 @@ def get_testnet_exchange(exchange_type="spot"):
             "options": {
                 "defaultType": "spot",
                 "fetchMarkets": {"types": ["spot"]},
+                "recvWindow": 10000,
+                "adjustForTimeDifference": True,
             },
         })
         exchange.enable_demo_trading(True)
@@ -954,7 +1064,7 @@ def send_telegram(message):
 # 5c. PERSISTENZA STATO E MODELLO
 # ─────────────────────────────────────────────
 
-def save_state(entry_price, entry_qty, entry_time=None, position_type=None):
+def save_state(entry_price, entry_qty, entry_time=None, position_type=None, trail_stop=None):
     """Salva lo stato della posizione su file JSON (LONG/SHORT/flat)."""
     with open(STATE_FILE, "w") as f:
         json.dump({
@@ -962,13 +1072,14 @@ def save_state(entry_price, entry_qty, entry_time=None, position_type=None):
             "entry_qty": entry_qty,
             "entry_time": entry_time.isoformat() if entry_time else None,
             "position_type": position_type,  # "long", "short", or None
+            "trail_stop": trail_stop,         # trailing stop price
         }, f)
 
 
 def load_state():
     """
     Carica lo stato della posizione da file JSON.
-    Ritorna (entry_price, entry_qty, entry_time, position_type).
+    Ritorna (entry_price, entry_qty, entry_time, position_type, trail_stop).
     Backward compat: vecchi file senza position_type → assume "long" se entry_price esiste.
     """
     if os.path.isfile(STATE_FILE):
@@ -982,10 +1093,11 @@ def load_state():
             pt = s.get("position_type")
             if ep and not pt:
                 pt = "long"
-            return ep, s.get("entry_qty"), entry_time, pt
+            ts = s.get("trail_stop")
+            return ep, s.get("entry_qty"), entry_time, pt, ts
         except (json.JSONDecodeError, KeyError, ValueError):
             pass
-    return None, None, None, None
+    return None, None, None, None, None
 
 
 def save_dashboard_data(price, buy_proba, signal_str, usdt, btc,
@@ -1187,10 +1299,10 @@ def run_bot(model_buy, model_short=None):
     print("=" * 55)
 
     # Carica stato precedente (sopravvive a restart)
-    entry_price, entry_qty, entry_time, position_type = load_state()
+    entry_price, entry_qty, entry_time, position_type, trail_stop = load_state()
     if entry_price:
         print(f"Stato caricato: {position_type.upper()} @ {entry_price:.2f} "
-              f"({entry_qty} BTC)")
+              f"({entry_qty} BTC, trail_stop: {trail_stop})")
 
     last_retrain = time.time()
     last_status  = time.time()
@@ -1225,7 +1337,13 @@ def run_bot(model_buy, model_short=None):
             # --- Fetch dati e segnali ---
             df      = fetch_ohlcv()
             save_price_history(df)
-            df_feat = build_features(df)
+            # Fetch candele 15m fresche (aggiornate ogni ciclo 15min)
+            try:
+                df_15m = fetch_ohlcv(symbol=SYMBOL, timeframe="15m", limit=2000)
+            except Exception as e:
+                print(f"  [WARN] Fetch 15m fallito: {e}")
+                df_15m = None
+            df_feat = build_features(df, df_15m=df_15m)
 
             last_row   = df_feat[FEATURES].iloc[-1:]
             buy_proba  = model_buy.predict_proba(last_row)[0][1]
@@ -1314,32 +1432,52 @@ def run_bot(model_buy, model_short=None):
                 last_status = time.time()
 
             # ============================================
-            # STOP LOSS (SEMPRE attivo, prima di tutto)
+            # TRAILING STOP (SEMPRE attivo, prima di tutto)
             # ============================================
+            cur_atr = df_feat["atr"].iloc[-1] if len(df_feat) > 0 else 0
 
-            # Stop loss LONG
+            # Stop loss / Trailing stop LONG
             if position_type == "long" and entry_price and btc > 0.0001:
-                loss_pct = (price - entry_price) / entry_price
-                if loss_pct <= -STOP_LOSS:
+                pnl_pct_now = (price - entry_price) / entry_price
+                stop_triggered = False
+
+                if pnl_pct_now >= TRAIL_ACTIVATE:
+                    # In profitto >= 1%: attiva/aggiorna trailing stop
+                    new_trail = price - cur_atr * TRAIL_ATR_MULT
+                    if trail_stop is None:
+                        trail_stop = max(new_trail, entry_price)  # almeno breakeven
+                    else:
+                        trail_stop = max(trail_stop, new_trail)
+                    save_state(entry_price, entry_qty, entry_time, position_type, trail_stop)
+                    if price <= trail_stop:
+                        stop_triggered = True
+                        dash_action = "TRAIL_STOP_LONG"
+                        dash_reason = f"Price ${price:,.0f} <= trail ${trail_stop:,.0f} (ATR×{TRAIL_ATR_MULT})"
+                else:
+                    # Non in profitto: stop loss fisso classico
+                    if pnl_pct_now <= -STOP_LOSS:
+                        stop_triggered = True
+                        dash_action = "STOP_LOSS_LONG"
+                        dash_reason = f"Loss {pnl_pct_now:.2%} <= -{STOP_LOSS:.0%}"
+
+                if stop_triggered:
                     qty = int(btc * 1e6) / 1e6
                     pnl_usd = (price - entry_price) * qty
                     try:
                         exchange_spot.create_order(SYMBOL, "market", "sell", qty)
                     except Exception as e:
-                        print(f"  [ERRORE] Stop loss LONG fallito: {e}")
-                        send_telegram(f"🚨 <b>Stop Loss LONG fallito</b>\n<code>{e}</code>")
+                        print(f"  [ERRORE] Stop LONG fallito: {e}")
+                        send_telegram(f"🚨 <b>Stop LONG fallito</b>\n<code>{e}</code>")
                         continue
-                    dash_action = "STOP_LOSS_LONG"
-                    dash_reason = f"Loss {loss_pct:.2%} <= -{STOP_LOSS:.0%}"
-                    entry_price = None; entry_qty = None; entry_time = None; position_type = None
-                    save_state(entry_price, entry_qty, entry_time, position_type)
-                    print(f"  -> STOP LOSS LONG: SELL {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
-                    log_trade("SELL(SL)", qty, price, "STOP_LOSS_LONG", buy_proba, pnl_usd)
+                    entry_price = None; entry_qty = None; entry_time = None; position_type = None; trail_stop = None
+                    save_state(entry_price, entry_qty, entry_time, position_type, trail_stop)
+                    print(f"  -> {dash_action}: SELL {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
+                    log_trade("SELL(TS)" if "TRAIL" in dash_action else "SELL(SL)", qty, price, dash_action, buy_proba, pnl_usd)
                     send_telegram(
-                        f"🛑 <b>Stop Loss LONG</b>\n"
+                        f"🛑 <b>{dash_action.replace('_', ' ')}</b>\n"
                         f"━━━━━━━━━━━━━━━\n"
                         f"🔴 SELL {qty} BTC @ ${price:,.2f}\n"
-                        f"📉 Loss: {loss_pct:.2%} | P&amp;L: ${pnl_usd:+,.2f}"
+                        f"📉 P&amp;L: {pnl_pct_now:.2%} | ${pnl_usd:+,.2f}"
                     )
                     try:
                         save_dashboard_data(price, buy_proba, signal_str, usdt, btc,
@@ -1350,29 +1488,48 @@ def run_bot(model_buy, model_short=None):
                     time.sleep(SLEEP_SECONDS)
                     continue  # NON aprire nuove posizioni nello stesso ciclo
 
-            # Stop loss SHORT
+            # Stop loss / Trailing stop SHORT
             if position_type == "short" and entry_price and exchange_futures:
-                loss_pct = (entry_price - price) / entry_price  # prezzo sale = perdita
-                if loss_pct <= -SHORT_STOP_LOSS:
+                pnl_pct_now = (entry_price - price) / entry_price
+                stop_triggered = False
+
+                if pnl_pct_now >= TRAIL_ACTIVATE:
+                    # In profitto >= 1%: attiva/aggiorna trailing stop
+                    new_trail = price + cur_atr * TRAIL_ATR_MULT
+                    if trail_stop is None:
+                        trail_stop = min(new_trail, entry_price)  # almeno breakeven
+                    else:
+                        trail_stop = min(trail_stop, new_trail)
+                    save_state(entry_price, entry_qty, entry_time, position_type, trail_stop)
+                    if price >= trail_stop:
+                        stop_triggered = True
+                        dash_action = "TRAIL_STOP_SHORT"
+                        dash_reason = f"Price ${price:,.0f} >= trail ${trail_stop:,.0f} (ATR×{TRAIL_ATR_MULT})"
+                else:
+                    # Non in profitto: stop loss fisso classico
+                    if pnl_pct_now <= -SHORT_STOP_LOSS:
+                        stop_triggered = True
+                        dash_action = "STOP_LOSS_SHORT"
+                        dash_reason = f"Loss {pnl_pct_now:.2%} <= -{SHORT_STOP_LOSS:.0%}"
+
+                if stop_triggered:
                     qty = entry_qty or 0
                     pnl_usd = (entry_price - price) * qty
                     try:
                         exchange_futures.create_order(SYMBOL, "market", "buy", qty)
                     except Exception as e:
-                        print(f"  [ERRORE] Stop loss SHORT fallito: {e}")
-                        send_telegram(f"🚨 <b>Stop Loss SHORT fallito</b>\n<code>{e}</code>")
+                        print(f"  [ERRORE] Stop SHORT fallito: {e}")
+                        send_telegram(f"🚨 <b>Stop SHORT fallito</b>\n<code>{e}</code>")
                         continue
-                    dash_action = "STOP_LOSS_SHORT"
-                    dash_reason = f"Loss {loss_pct:.2%} <= -{SHORT_STOP_LOSS:.0%}"
-                    entry_price = None; entry_qty = None; entry_time = None; position_type = None
-                    save_state(entry_price, entry_qty, entry_time, position_type)
-                    print(f"  -> STOP LOSS SHORT: BUY {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
-                    log_trade("BUY(SL)", qty, price, "STOP_LOSS_SHORT", short_proba, pnl_usd)
+                    entry_price = None; entry_qty = None; entry_time = None; position_type = None; trail_stop = None
+                    save_state(entry_price, entry_qty, entry_time, position_type, trail_stop)
+                    print(f"  -> {dash_action}: BUY {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
+                    log_trade("BUY(TS)" if "TRAIL" in dash_action else "BUY(SL)", qty, price, dash_action, short_proba, pnl_usd)
                     send_telegram(
-                        f"🛑 <b>Stop Loss SHORT</b>\n"
+                        f"🛑 <b>{dash_action.replace('_', ' ')}</b>\n"
                         f"━━━━━━━━━━━━━━━\n"
                         f"🟢 BUY(cover) {qty} BTC @ ${price:,.2f}\n"
-                        f"📈 Loss: {loss_pct:.2%} | P&amp;L: ${pnl_usd:+,.2f}"
+                        f"📈 P&amp;L: {pnl_pct_now:.2%} | ${pnl_usd:+,.2f}"
                     )
                     try:
                         save_dashboard_data(price, buy_proba, signal_str, usdt, btc,
@@ -1404,12 +1561,20 @@ def run_bot(model_buy, model_short=None):
             # APERTURA POSIZIONI (solo se flat)
             # ============================================
 
+            # Leggi filtri 15m e ADX per ingresso
+            mom_15m_val = df_feat["mom_15m"].iloc[-1] if "mom_15m" in df_feat.columns else 0
+            adx_val = df_feat["adx"].iloc[-1] if "adx" in df_feat.columns else 0
+
             if buy_signal and usdt > 10 and not position_type:
                 trend_ok = df_feat["trend_up"].iloc[-1] == 1
                 if not trend_ok:
                     dash_action = "BUY_BLOCKED"
                     dash_reason = f"Trend DOWN (prezzo < EMA20), BUY {buy_proba:.0%} bloccato"
                     print(f"  -> Trend ribassista (prezzo < EMA20), BUY bloccato.")
+                elif mom_15m_val != 0 and mom_15m_val < 0:
+                    dash_action = "BUY_BLOCKED"
+                    dash_reason = f"Mom 15m {mom_15m_val:.4f} < 0, impulso esaurito"
+                    print(f"  -> BUY bloccato: momentum 15m negativo ({mom_15m_val:.4f})")
                 else:
                     qty = round((usdt * TRADE_SIZE) / price, 6)
                     try:
@@ -1419,11 +1584,11 @@ def run_bot(model_buy, model_short=None):
                         send_telegram(f"🚨 <b>BUY fallito</b>\n<code>{e}</code>")
                         continue
                     dash_action = "OPEN_LONG"
-                    dash_reason = f"BUY {buy_proba:.0%} >= {MIN_PROBA:.0%}, trend UP"
-                    entry_price = price; entry_qty = qty
+                    dash_reason = f"BUY {buy_proba:.0%} >= {MIN_PROBA:.0%}, trend UP, mom15m OK"
+                    entry_price = price; entry_qty = qty; trail_stop = None
                     entry_time = datetime.now(timezone.utc); position_type = "long"
-                    save_state(entry_price, entry_qty, entry_time, position_type)
-                    print(f"  -> ORDER: BUY {qty} BTC @ {price:.2f} (prob: {buy_proba:.0%})")
+                    save_state(entry_price, entry_qty, entry_time, position_type, trail_stop)
+                    print(f"  -> ORDER: BUY {qty} BTC @ {price:.2f} (prob: {buy_proba:.0%}, mom15m: {mom_15m_val:.4f})")
                     log_trade("BUY", qty, price, "BUY", buy_proba)
                     send_telegram(
                         f"🟢 <b>BUY eseguito</b>\n"
@@ -1439,6 +1604,14 @@ def run_bot(model_buy, model_short=None):
                     dash_action = "SHORT_BLOCKED"
                     dash_reason = f"Trend UP (prezzo > EMA20), SHORT {short_proba:.0%} bloccato"
                     print(f"  -> Trend rialzista (prezzo > EMA20), SHORT bloccato.")
+                elif mom_15m_val != 0 and mom_15m_val > 0:
+                    dash_action = "SHORT_BLOCKED"
+                    dash_reason = f"Mom 15m {mom_15m_val:.4f} > 0, impulso ribassista assente"
+                    print(f"  -> SHORT bloccato: momentum 15m positivo ({mom_15m_val:.4f})")
+                elif adx_val < SHORT_ADX_MIN:
+                    dash_action = "SHORT_BLOCKED"
+                    dash_reason = f"ADX {adx_val:.1f} < {SHORT_ADX_MIN}, trend troppo debole"
+                    print(f"  -> SHORT bloccato: ADX {adx_val:.1f} < {SHORT_ADX_MIN} (trend debole)")
                 else:
                     qty = round((usdt * SHORT_TRADE_SIZE) / price, 6)
                     try:
@@ -1448,11 +1621,11 @@ def run_bot(model_buy, model_short=None):
                         send_telegram(f"🚨 <b>SHORT fallito</b>\n<code>{e}</code>")
                         continue
                     dash_action = "OPEN_SHORT"
-                    dash_reason = f"SHORT {short_proba:.0%} >= {SHORT_MIN_PROBA:.0%}, trend DOWN"
-                    entry_price = price; entry_qty = qty
+                    dash_reason = f"SHORT {short_proba:.0%} >= {SHORT_MIN_PROBA:.0%}, trend DOWN, ADX {adx_val:.0f}"
+                    entry_price = price; entry_qty = qty; trail_stop = None
                     entry_time = datetime.now(timezone.utc); position_type = "short"
-                    save_state(entry_price, entry_qty, entry_time, position_type)
-                    print(f"  -> ORDER: SHORT {qty} BTC @ {price:.2f} (prob: {short_proba:.0%})")
+                    save_state(entry_price, entry_qty, entry_time, position_type, trail_stop)
+                    print(f"  -> ORDER: SHORT {qty} BTC @ {price:.2f} (prob: {short_proba:.0%}, ADX: {adx_val:.0f})")
                     log_trade("SHORT", qty, price, "SHORT", short_proba)
                     send_telegram(
                         f"🔴 <b>SHORT eseguito</b>\n"
@@ -1477,8 +1650,8 @@ def run_bot(model_buy, model_short=None):
                     continue
                 dash_action = "CLOSE_LONG"
                 dash_reason = f"SELL tecnico (RSI/MACD/EMA)"
-                entry_price = None; entry_qty = None; entry_time = None; position_type = None
-                save_state(entry_price, entry_qty, entry_time, position_type)
+                entry_price = None; entry_qty = None; entry_time = None; position_type = None; trail_stop = None
+                save_state(entry_price, entry_qty, entry_time, position_type, trail_stop)
                 print(f"  -> ORDER: CLOSE LONG {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
                 log_trade("SELL", qty, price, "SELL_TECH", buy_proba, pnl_usd)
                 pnl_icon = "📈" if pnl_usd >= 0 else "📉"
@@ -1500,8 +1673,8 @@ def run_bot(model_buy, model_short=None):
                     continue
                 dash_action = "CLOSE_SHORT"
                 dash_reason = f"COVER tecnico (RSI/MACD/EMA)"
-                entry_price = None; entry_qty = None; entry_time = None; position_type = None
-                save_state(entry_price, entry_qty, entry_time, position_type)
+                entry_price = None; entry_qty = None; entry_time = None; position_type = None; trail_stop = None
+                save_state(entry_price, entry_qty, entry_time, position_type, trail_stop)
                 print(f"  -> ORDER: CLOSE SHORT {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
                 log_trade("COVER", qty, price, "COVER_TECH", short_proba, pnl_usd)
                 pnl_icon = "📈" if pnl_usd >= 0 else "📉"
@@ -1537,27 +1710,48 @@ def run_bot(model_buy, model_short=None):
 
         except TRANSIENT_ERRORS as e:
             consecutive_net_errors += 1
+            tb_short = traceback.format_exc().strip().split("\n")
+            tb_last = "\n".join(tb_short[-4:]) if len(tb_short) >= 4 else "\n".join(tb_short)
+            err_class = " > ".join(
+                c.__name__ for c in type(e).__mro__ if c is not object
+            )
             err_msg = f"{type(e).__name__}: {e}"
+            ts = datetime.now().strftime("%H:%M:%S")
             if consecutive_net_errors <= MAX_RETRIES:
                 wait = RETRY_BACKOFF[consecutive_net_errors - 1]
-                print(f"[RETRY {consecutive_net_errors}/{MAX_RETRIES}] {err_msg}")
+                print(f"[RETRY {consecutive_net_errors}/{MAX_RETRIES}] {ts} {err_msg}")
                 print(f"  -> Riprovo tra {wait}s...")
                 time.sleep(wait)
                 continue
             else:
-                print(f"[ERRORE] {err_msg} (dopo {MAX_RETRIES} tentativi)")
+                print(f"[ERRORE] {ts} {err_msg} (dopo {MAX_RETRIES} tentativi)")
+                print(f"  Traceback:\n{traceback.format_exc()}")
                 send_telegram(
                     f"🚨 <b>Errore di rete</b> (dopo {MAX_RETRIES} tentativi)\n"
-                    f"<code>{err_msg[:500]}</code>"
+                    f"⏰ {ts}\n"
+                    f"🔗 <b>Tipo:</b> <code>{err_class}</code>\n"
+                    f"💬 <code>{err_msg[:300]}</code>\n"
+                    f"📋 <b>Traceback:</b>\n<code>{tb_last[:300]}</code>"
                 )
                 consecutive_net_errors = 0
 
         except Exception as e:
+            tb_short = traceback.format_exc().strip().split("\n")
+            tb_last = "\n".join(tb_short[-4:]) if len(tb_short) >= 4 else "\n".join(tb_short)
+            err_class = " > ".join(
+                c.__name__ for c in type(e).__mro__ if c is not object
+            )
             err_msg = f"{type(e).__name__}: {e}"
-            print(f"[ERRORE] {err_msg}")
+            ts = datetime.now().strftime("%H:%M:%S")
+            print(f"[ERRORE] {ts} {err_msg}")
+            print(f"  Tipo: {err_class}")
+            print(f"  Traceback:\n{traceback.format_exc()}")
             send_telegram(
                 f"🚨 <b>Errore</b>\n"
-                f"<code>{err_msg[:500]}</code>"
+                f"⏰ {ts}\n"
+                f"🔗 <b>Tipo:</b> <code>{err_class}</code>\n"
+                f"💬 <code>{err_msg[:300]}</code>\n"
+                f"📋 <b>Traceback:</b>\n<code>{tb_last[:300]}</code>"
             )
             consecutive_net_errors = 0
 
