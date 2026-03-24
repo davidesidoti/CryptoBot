@@ -50,39 +50,48 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT:
     print("       Le notifiche Telegram saranno disabilitate.")
 
 SYMBOL          = "BTC/USDT"
-TIMEFRAME       = "1h"        # candele orarie
-FETCH_LIMIT     = 10000       # quante candele storiche scaricare (paginato, ~416 giorni)
+TIMEFRAME       = "5m"        # candele 5 minuti (scalping)
+FETCH_LIMIT     = 15000       # quante candele storiche scaricare (paginato, ~52 giorni a 5m)
 N_TRAIN         = 400         # candele usate per il training
-FUTURE_BARS     = 5           # quante candele in avanti per calcolare il label
-SIGNAL_THRESH   = 0.007       # 0.7% di movimento minimo per generare segnale
-MIN_PROBA       = 0.55        # confidenza minima per eseguire un ordine
-TRADE_SIZE      = 0.95        # % del capitale usata per ogni trade
-STOP_LOSS       = 0.02        # 2% stop loss fisso (prima che trailing si attivi)
-TRAIL_ATR_MULT  = 3.0         # trailing stop = ATR * questo moltiplicatore
-TRAIL_ACTIVATE  = 0.01        # trailing si attiva solo dopo +1% di profitto
+FUTURE_BARS     = 3           # quante candele in avanti per calcolare il label (15 min)
+SIGNAL_THRESH   = 0.003       # 0.3% di movimento minimo per generare segnale
+MIN_PROBA       = 0.58        # confidenza minima per BUY
+TRADE_SIZE      = 0.80        # % del capitale usata per ogni trade
+STOP_LOSS       = 0.004       # 0.4% stop loss (scalping)
+TRAIL_ATR_MULT  = 1.5         # trailing stop = ATR * 1.5 (stretto per scalping)
+TRAIL_ACTIVATE  = 0.003       # trailing si attiva dopo +0.3% di profitto
+TAKE_PROFIT     = 0.006       # 0.6% take profit
 INITIAL_CASH    = 500         # capitale iniziale per il backtest (in USD)
-SLEEP_SECONDS   = 900         # secondi tra ogni ciclo del bot (15 min)
+SLEEP_SECONDS   = 60          # secondi tra ogni ciclo del bot (1 min, segnali ML ogni 5m)
 MAX_RETRIES     = 3           # tentativi per errori di rete transitori
-RETRY_BACKOFF   = [30, 60, 120]  # secondi di attesa tra retry
-MIN_HOLD_BARS   = 5           # hold minimo 5h prima di SELL tecnico (= FUTURE_BARS, stop loss escluso)
+RETRY_BACKOFF   = [5, 15, 30] # secondi di attesa tra retry (piu' veloci per scalping)
+MIN_HOLD_BARS   = 2           # hold minimo 2 barre = 10 min
 LOG_FILE        = "trades_log.csv"
-RETRAIN_HOURS   = 24            # riaddestra il modello ogni N ore
+RETRAIN_HOURS   = 12          # riaddestra il modello ogni 12 ore (piu' frequente per 5m)
 MODEL_FILE      = "model.joblib"
 STATE_FILE      = "bot_state.json"
 DASHBOARD_FILE  = "dashboard_data.json"
 PRICE_HISTORY_FILE = "price_history.json"
 
-# SHORT parameters
-SHORT_STOP_LOSS    = 0.02    # 2% stop loss per SHORT (iniziale, poi trailing)
-SHORT_MIN_PROBA    = 0.65    # soglia alta — SHORT solo con alta confidenza
-SHORT_TRADE_SIZE   = 0.70    # 70% capitale (meno aggressivo del LONG 95%)
-SHORT_MIN_HOLD     = 3       # hold minimo 3h (bear moves piu' veloci)
+# SHORT parameters (scalping)
+SHORT_STOP_LOSS    = 0.004   # 0.4% stop loss per SHORT (scalping)
+SHORT_MIN_PROBA    = 0.60    # soglia SHORT
+SHORT_TRADE_SIZE   = 0.80    # 80% capitale
+SHORT_MIN_HOLD     = 2       # hold minimo 2 barre = 10 min
 ENABLE_SHORT       = True    # flag per abilitare/disabilitare SHORT
-SHORT_ADX_MIN      = 20      # ADX minimo per aprire SHORT (richiede trend forte)
+SHORT_ADX_MIN      = 15      # ADX minimo per SHORT (naturalmente piu' basso su 5m)
 
-# Model files (dual model)
-MODEL_BUY_FILE     = "model_buy.joblib"
-MODEL_SHORT_FILE   = "model_short.joblib"
+# Futures-only mode (entrambi LONG e SHORT su Futures per fee 0.02% maker)
+USE_FUTURES_FOR_BOTH = True
+
+# Model files (dual model, rinominati per evitare conflitto col branch main)
+MODEL_BUY_FILE     = "model_buy_scalp.joblib"
+MODEL_SHORT_FILE   = "model_short_scalp.joblib"
+
+# Optuna cache files (scalping)
+OPTUNA_BUY_FILE    = "best_params_buy_scalp.json"
+OPTUNA_SHORT_FILE  = "best_params_short_scalp.json"
+OPTUNA_TRIALS      = 100     # trial per ottimizzazione bayesiana (per modello, +67% vs v1)
 
 TRANSIENT_ERRORS = (
     ccxt.NetworkError,      # copre ExchangeNotAvailable, RequestTimeout, DDoSProtection
@@ -90,25 +99,29 @@ TRANSIENT_ERRORS = (
 )
 
 FEATURES = [
-    "rsi", "macd", "macd_signal", "bb_width",
-    "vol_change", "price_change", "ema_cross",
-    "atr", "obv_change", "stoch_k", "rsi_slope", "hour",
-    # Nuove features
-    "adx", "willr", "vwap_dist",
-    # Multi-timeframe features (resampled da 1h)
-    "rsi_4h", "macd_4h", "ema_cross_4h", "trend_4h",
-    "rsi_1d", "adx_1d",
-    # Regime / volatilita'
-    "atr_ratio", "vol_regime",
-    # SHORT-specific
-    "trend_down", "macd_hist",
-    # 15m sub-hourly features (early entry detection)
-    "rsi_15m", "macd_15m", "macd_hist_15m", "mom_15m", "vol_spike_15m"
+    # 5m base - oscillatori/momentum (11)
+    "rsi_fast", "rsi_slope",
+    "macd_fast", "macd_signal_fast", "macd_hist_fast",
+    "stoch_k", "stoch_d",
+    "bb_width", "bb_pct",
+    "willr", "cci",
+    # 5m dinamica prezzo/volume (7)
+    "price_change", "price_change_3",
+    "vol_change", "vol_spike",
+    "vwap_dist", "atr", "atr_ratio",
+    # 5m microstruttura (3)
+    "spread_proxy", "body_ratio", "ema_cross_fast",
+    # 15m contesto (resample da 5m) (3)
+    "rsi_15m", "macd_15m", "trend_15m",
+    # 1h contesto (resample da 5m) (3)
+    "rsi_1h", "trend_1h", "adx_1h",
+    # Tempo (1)
+    "minute_of_day",
 ]
 
-# Walk-forward validation
-WF_TRAIN_BARS   = 1500        # candele per ogni finestra di training
-WF_TEST_BARS    = 200         # candele per ogni finestra di test
+# Walk-forward validation (scalping)
+WF_TRAIN_BARS   = 3000        # candele per ogni finestra di training (+50%, ~10 giorni a 5m)
+WF_TEST_BARS    = 500         # candele per ogni finestra di test (~1.7 giorni)
 
 # ─────────────────────────────────────────────
 # 1. FETCH DATI
@@ -188,138 +201,94 @@ def fetch_ohlcv(symbol=SYMBOL, timeframe=TIMEFRAME, limit=FETCH_LIMIT):
 # 2. FEATURE ENGINEERING + LABEL
 # ─────────────────────────────────────────────
 
-def build_features(df, df_15m=None):
+def build_features(df):
     """
-    Aggiunge indicatori tecnici e calcola il label:
+    Aggiunge indicatori tecnici scalping e calcola il label:
       +1  = BUY  (prezzo sale > soglia dinamica ATR nelle prossime FUTURE_BARS candele)
       -1  = SELL (prezzo scende)
        0  = HOLD
-    Include feature multi-timeframe (4h, 1d) resamplandole dal dataset 1h.
-    Include feature 15m sub-hourly per early entry detection.
-    Se df_15m non fornito, lo scarica automaticamente da Binance.
+    Timeframe primario: 5m. Contesto: 15m e 1h (resampleati dal 5m).
     """
     df = df.copy()
 
-    # === Feature 1h (base) ===
-    df["rsi"]         = ta.rsi(df["close"], length=14)
-    macd_df           = ta.macd(df["close"])
-    df["macd"]        = macd_df["MACD_12_26_9"]
-    df["macd_signal"] = macd_df["MACDs_12_26_9"]
-    bb                = ta.bbands(df["close"], length=20)
-    df["bb_upper"]    = bb["BBU_20_2.0_2.0"]
-    df["bb_lower"]    = bb["BBL_20_2.0_2.0"]
-    df["bb_width"]    = (df["bb_upper"] - df["bb_lower"]) / df["close"]
-    df["vol_change"]  = df["volume"].pct_change()
-    df["price_change"]= df["close"].pct_change()
-    df["ema_9"]       = ta.ema(df["close"], length=9)
-    df["ema_21"]      = ta.ema(df["close"], length=21)
-    df["ema_cross"]   = df["ema_9"] - df["ema_21"]
-    df["atr"]         = ta.atr(df["high"], df["low"], df["close"], length=14)
-    obv               = ta.obv(df["close"], df["volume"])
-    df["obv_change"]  = obv.pct_change()
-    stoch              = ta.stoch(df["high"], df["low"], df["close"])
+    # === Feature 5m (base) - oscillatori/momentum ===
+    df["rsi_fast"]    = ta.rsi(df["close"], length=7)
+    df["rsi_slope"]   = df["rsi_fast"].diff(3)
+    macd_df           = ta.macd(df["close"], fast=8, slow=21, signal=5)
+    df["macd_fast"]        = macd_df.iloc[:, 0]  # MACD line
+    df["macd_signal_fast"] = macd_df.iloc[:, 2]  # Signal line
+    df["macd_hist_fast"]   = macd_df.iloc[:, 1]  # Histogram
+    stoch = ta.stoch(df["high"], df["low"], df["close"], k=5, d=3, smooth_k=3)
     df["stoch_k"]     = stoch.iloc[:, 0]
-    df["rsi_slope"]   = df["rsi"].diff(5)
-    df["hour"]        = df.index.hour
-    df["ema_20"]      = ta.ema(df["close"], length=20)
-    df["trend_up"]    = (df["close"] > df["ema_20"]).astype(int)
+    df["stoch_d"]     = stoch.iloc[:, 1]
+    bb = ta.bbands(df["close"], length=10)
+    bb_upper = bb.iloc[:, 2]  # BBU
+    bb_lower = bb.iloc[:, 0]  # BBL
+    df["bb_width"]    = (bb_upper - bb_lower) / df["close"]
+    df["bb_pct"]      = (df["close"] - bb_lower) / (bb_upper - bb_lower + 1e-10)
+    df["willr"]       = ta.willr(df["high"], df["low"], df["close"], length=7)
+    df["cci"]         = ta.cci(df["high"], df["low"], df["close"], length=14)
 
-    # Nuove features
-    adx_df            = ta.adx(df["high"], df["low"], df["close"], length=14)
-    df["adx"]         = adx_df["ADX_14"]          # forza del trend (0-100)
-    df["willr"]       = ta.willr(df["high"], df["low"], df["close"], length=14)  # Williams %R
-    # VWAP distance: distanza % del prezzo dal VWAP rolling (proxy intraday)
-    cum_vol           = df["volume"].rolling(20).sum()
-    cum_vp            = (df["close"] * df["volume"]).rolling(20).sum()
-    vwap_20           = cum_vp / cum_vol
-    df["vwap_dist"]   = (df["close"] - vwap_20) / vwap_20  # >0 = sopra VWAP
+    # === Feature 5m - dinamica prezzo/volume ===
+    df["price_change"]   = df["close"].pct_change()
+    df["price_change_3"] = df["close"].pct_change(3)
+    df["vol_change"]     = df["volume"].pct_change()
+    vol_ma_20            = df["volume"].rolling(20).mean()
+    df["vol_spike"]      = df["volume"] / (vol_ma_20 + 1e-10)
+    cum_vol              = df["volume"].rolling(20).sum()
+    cum_vp               = (df["close"] * df["volume"]).rolling(20).sum()
+    vwap_20              = cum_vp / (cum_vol + 1e-10)
+    df["vwap_dist"]      = (df["close"] - vwap_20) / (vwap_20 + 1e-10)
+    df["atr"]            = ta.atr(df["high"], df["low"], df["close"], length=10)
+    atr_fast             = ta.atr(df["high"], df["low"], df["close"], length=5)
+    atr_slow             = ta.atr(df["high"], df["low"], df["close"], length=20)
+    df["atr_ratio"]      = atr_fast / (atr_slow + 1e-10)
 
-    # === Feature multi-timeframe (resample da 1h) ===
-    # 4h
-    df_4h = df[["open", "high", "low", "close", "volume"]].resample("4h").agg({
+    # === Feature 5m - microstruttura ===
+    bar_range            = df["high"] - df["low"]
+    df["spread_proxy"]   = bar_range / df["close"]
+    df["body_ratio"]     = abs(df["close"] - df["open"]) / (bar_range + 1e-10)
+    ema5                 = ta.ema(df["close"], length=5)
+    ema20                = ta.ema(df["close"], length=20)
+    df["ema_cross_fast"] = ema5 - ema20
+
+    # trend_up interno (usato per filtri, non e' una feature ML)
+    df["ema_20"]         = ema20
+    df["trend_up"]       = (df["close"] > ema20).astype(int)
+
+    # === Feature 15m contesto (resample da 5m) ===
+    df_15m = df[["open", "high", "low", "close", "volume"]].resample("15min").agg({
         "open": "first", "high": "max", "low": "min",
         "close": "last", "volume": "sum"
     }).dropna()
-    df_4h["rsi_4h"]      = ta.rsi(df_4h["close"], length=14)
-    macd_4h              = ta.macd(df_4h["close"])
-    df_4h["macd_4h"]     = macd_4h["MACD_12_26_9"]
-    ema9_4h              = ta.ema(df_4h["close"], length=9)
-    ema21_4h             = ta.ema(df_4h["close"], length=21)
-    df_4h["ema_cross_4h"] = ema9_4h - ema21_4h
-    ema20_4h             = ta.ema(df_4h["close"], length=20)
-    df_4h["trend_4h"]    = (df_4h["close"] > ema20_4h).astype(int)
-    # Forward-fill su timeframe 1h (ogni candela 4h vale per le 4 candele 1h successive)
-    for col in ["rsi_4h", "macd_4h", "ema_cross_4h", "trend_4h"]:
-        df[col] = df_4h[col].reindex(df.index, method="ffill")
+    df_15m["rsi_15m"]  = ta.rsi(df_15m["close"], length=14)
+    macd_15m           = ta.macd(df_15m["close"])
+    df_15m["macd_15m"] = macd_15m.iloc[:, 0] if macd_15m is not None else 0.0
+    ema20_15m          = ta.ema(df_15m["close"], length=20)
+    df_15m["trend_15m"] = (df_15m["close"] > ema20_15m).astype(int)
+    for col in ["rsi_15m", "macd_15m", "trend_15m"]:
+        df[col] = df_15m[col].reindex(df.index, method="ffill")
 
-    # 1d
-    df_1d = df[["open", "high", "low", "close", "volume"]].resample("1D").agg({
+    # === Feature 1h contesto (resample da 5m) ===
+    df_1h = df[["open", "high", "low", "close", "volume"]].resample("1h").agg({
         "open": "first", "high": "max", "low": "min",
         "close": "last", "volume": "sum"
     }).dropna()
-    df_1d["rsi_1d"]   = ta.rsi(df_1d["close"], length=14)
-    adx_1d_df         = ta.adx(df_1d["high"], df_1d["low"], df_1d["close"], length=14)
-    df_1d["adx_1d"]   = adx_1d_df["ADX_14"]  # forza trend daily (sostituisce trend_1d)
-    for col in ["rsi_1d", "adx_1d"]:
-        df[col] = df_1d[col].reindex(df.index, method="ffill")
+    df_1h["rsi_1h"]   = ta.rsi(df_1h["close"], length=14)
+    ema20_1h           = ta.ema(df_1h["close"], length=20)
+    df_1h["trend_1h"]  = (df_1h["close"] > ema20_1h).astype(int)
+    adx_1h_df          = ta.adx(df_1h["high"], df_1h["low"], df_1h["close"], length=14)
+    df_1h["adx_1h"]    = adx_1h_df["ADX_14"]
+    for col in ["rsi_1h", "trend_1h", "adx_1h"]:
+        df[col] = df_1h[col].reindex(df.index, method="ffill")
 
-    # === Regime / volatilita' ===
-    atr_fast = ta.atr(df["high"], df["low"], df["close"], length=7)
-    atr_slow = ta.atr(df["high"], df["low"], df["close"], length=28)
-    df["atr_ratio"]  = atr_fast / atr_slow  # >1 = volatilita' in aumento
-    vol_20 = df["volume"].rolling(20).mean()
-    df["vol_regime"] = df["volume"] / vol_20  # >1 = volume sopra media
+    # === Tempo ===
+    df["minute_of_day"] = df.index.hour * 60 + df.index.minute
 
-    # === SHORT-specific features ===
-    df["trend_down"] = (df["close"] < df["ema_20"]).astype(int)  # inverso di trend_up
-    df["macd_hist"]  = df["macd"] - df["macd_signal"]            # MACD histogram esplicito
-
-    # === Feature 15m sub-hourly (early entry detection) ===
-    # Se non fornito, scarica candele 15m da Binance (4x le candele 1h)
-    if df_15m is None:
-        try:
-            n_15m = min(len(df) * 4, 10000)  # 4 candele 15m per ogni 1h
-            df_15m = fetch_ohlcv(symbol=SYMBOL, timeframe="15m", limit=n_15m)
-        except Exception as e:
-            print(f"[WARN] Fetch 15m fallito ({e}), uso NaN per features 15m")
-            df_15m = None
-
-    _15m_neutral = {"rsi_15m": 50.0, "macd_15m": 0.0, "macd_hist_15m": 0.0,
-                    "mom_15m": 0.0, "vol_spike_15m": 1.0}
-
-    if df_15m is not None and len(df_15m) > 20:
-        # Calcola indicatori su candele 15m
-        df_15m = df_15m.copy()
-        df_15m["rsi_15m"]      = ta.rsi(df_15m["close"], length=14)
-        macd_15m_df            = ta.macd(df_15m["close"])
-        df_15m["macd_15m"]     = macd_15m_df["MACD_12_26_9"]
-        df_15m["macd_sig_15m"] = macd_15m_df["MACDs_12_26_9"]
-        df_15m["macd_hist_15m"] = df_15m["macd_15m"] - df_15m["macd_sig_15m"]
-        # Momentum: variazione % nelle ultime 4 candele 15m (~1h granulare)
-        df_15m["mom_15m"]      = df_15m["close"].pct_change(4)
-        # Volume spike: rapporto volume corrente vs media 20 periodi
-        vol_ma_15m             = df_15m["volume"].rolling(20).mean()
-        df_15m["vol_spike_15m"] = df_15m["volume"] / vol_ma_15m
-
-        # Resample a 1h: prendi l'ultimo valore 15m di ogni ora (il piu' recente)
-        cols_15m = list(_15m_neutral.keys())
-        df_15m_hourly = df_15m[cols_15m].resample("1h").last()
-        for col in cols_15m:
-            df[col] = df_15m_hourly[col].reindex(df.index, method="ffill")
-        # Riempi NaN con valori neutri (righe 1h prima dell'inizio dei dati 15m)
-        for col, neutral in _15m_neutral.items():
-            df[col] = df[col].fillna(neutral)
-    else:
-        # Fallback: valori neutri (no signal = nessun effetto sul modello)
-        for col, neutral in _15m_neutral.items():
-            df[col] = neutral
-
-    # === Target dinamico (soglia basata su ATR) ===
-    # Usa ATR% come soglia: se mercato volatile, servono movimenti piu' grandi
+    # === Target dinamico (soglia basata su ATR, scalping) ===
     atr_pct = df["atr"] / df["close"]
-    # La soglia e' il massimo tra SIGNAL_THRESH fisso e 0.5*ATR%
-    # Questo evita falsi segnali in mercati volatili
-    dynamic_thresh = np.maximum(SIGNAL_THRESH, atr_pct * 0.5)
+    # Moltiplicatore 0.4 — bilancia tra cattura segnali e riduzione rumore
+    dynamic_thresh = np.maximum(SIGNAL_THRESH, atr_pct * 0.3)
 
     future_return     = df["close"].shift(-FUTURE_BARS) / df["close"] - 1
     df["label"]       = 0
@@ -362,7 +331,7 @@ def train_model(df, target_label=1):
     spw = neg_count / pos_count if pos_count > 0 else 1.0
 
     model = XGBClassifier(
-        n_estimators=500,
+        n_estimators=800,
         max_depth=4,
         learning_rate=0.03,
         min_child_weight=10,
@@ -381,7 +350,7 @@ def train_model(df, target_label=1):
         verbose=False
     )
 
-    print(f"\nMiglior iterazione ({label_name}): {model.best_iteration} / 500")
+    print(f"\nMiglior iterazione ({label_name}): {model.best_iteration} / 800")
     print(f"\n=== Valutazione modello {label_name} sul test set ===")
     preds = model.predict(X_test)
     print(classification_report(y_test, preds, target_names=[neg_name, label_name]))
@@ -392,11 +361,6 @@ def train_model(df, target_label=1):
 # ─────────────────────────────────────────────
 # 3b. OTTIMIZZAZIONE IPERPARAMETRI (OPTUNA)
 # ─────────────────────────────────────────────
-
-OPTUNA_BUY_FILE   = "best_params_buy.json"
-OPTUNA_SHORT_FILE = "best_params_short.json"
-OPTUNA_TRIALS     = 50  # numero di trial per la ricerca
-
 
 def optimize_hyperparams(df, target_label=1, cache_file=None, n_trials=OPTUNA_TRIALS):
     """
@@ -431,23 +395,23 @@ def optimize_hyperparams(df, target_label=1, cache_file=None, n_trials=OPTUNA_TR
 
     neg = (y_train == 0).sum()
     pos = (y_train == 1).sum()
-    spw = min(neg / pos, 50.0) if pos > 0 else 1.0
+    spw = min(neg / pos, 30.0) if pos > 0 else 1.0
     print(f"  Samples positivi ({label_name}): {pos}, negativi: {neg}, scale_pos_weight: {spw:.1f}")
 
     def objective(trial):
         params = {
-            "n_estimators": 500,
-            "max_depth": trial.suggest_int("max_depth", 3, 7),
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
-            "min_child_weight": trial.suggest_int("min_child_weight", 5, 30),
-            "subsample": trial.suggest_float("subsample", 0.6, 0.95),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 0.9),
-            "reg_alpha": trial.suggest_float("reg_alpha", 0.01, 2.0, log=True),
-            "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 5.0, log=True),
+            "n_estimators": 800,
+            "max_depth": trial.suggest_int("max_depth", 3, 6),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+            "min_child_weight": trial.suggest_int("min_child_weight", 10, 50),
+            "subsample": trial.suggest_float("subsample", 0.5, 0.9),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.4, 0.85),
+            "reg_alpha": trial.suggest_float("reg_alpha", 0.1, 5.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.5, 10.0, log=True),
             "scale_pos_weight": spw,
             "eval_metric": "logloss",
             "verbosity": 0,
-            "early_stopping_rounds": 80,
+            "early_stopping_rounds": 50,
         }
         m = XGBClassifier(**params)
         m.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
@@ -478,46 +442,44 @@ def optimize_hyperparams(df, target_label=1, cache_file=None, n_trials=OPTUNA_TR
 
 def technical_sell_signal(df):
     """
-    Genera segnali SELL basati su regole tecniche (non ML):
-    - RSI > 70 (ipercomprato)
-    - MACD cross ribassista (MACD < signal e in discesa)
-    - Prezzo sotto EMA20 (trend ribassista)
-    Ritorna una Series booleana con True dove c'e' segnale SELL.
+    Genera segnali SELL basati su regole tecniche (scalping):
+    - RSI fast > 65 (ipercomprato) + slope negativo
+    - MACD cross ribassista (singola barra)
+    - Prezzo crolla sotto EMA20 con momentum -0.3%
     """
     sell = pd.Series(False, index=df.index)
 
-    # RSI ipercomprato + inizio discesa (75 = vero ipercomprato per BTC)
-    sell |= (df["rsi"] > 75) & (df["rsi_slope"] < 0)
+    # RSI ipercomprato + inizio discesa
+    sell |= (df["rsi_fast"] > 65) & (df["rsi_slope"] < -2)
 
-    # MACD cross ribassista confermato (gap in aumento per 2 barre consecutive)
-    macd_gap = df["macd"] - df["macd_signal"]
-    sell |= (macd_gap < 0) & (macd_gap.diff() < 0) & (macd_gap.shift(1).diff() < 0)
+    # MACD cross ribassista (singola barra, reattivo per scalping)
+    macd_gap = df["macd_fast"] - df["macd_signal_fast"]
+    sell |= (macd_gap < 0) & (macd_gap.diff() < 0)
 
-    # Prezzo crolla sotto EMA20 con momentum significativo (0.8%)
-    sell |= (df["trend_up"] == 0) & (df["price_change"] < -0.008)
+    # Prezzo crolla sotto EMA20 con momentum (-0.3%)
+    sell |= (df["trend_up"] == 0) & (df["price_change"] < -0.003)
 
     return sell
 
 
 def technical_cover_signal(df):
     """
-    Genera segnali di COPERTURA SHORT basati su regole tecniche (speculare a sell):
-    - RSI < 25 (ipervenduto) + rimbalzo (rsi_slope > 0)
-    - MACD cross rialzista confermato (gap in aumento per 2 barre consecutive)
-    - Prezzo risale sopra EMA20 con momentum significativo (0.8%)
-    Ritorna una Series booleana con True dove c'e' segnale COVER (chiudi SHORT).
+    Genera segnali di COPERTURA SHORT basati su regole tecniche (scalping):
+    - RSI fast < 35 (ipervenduto) + rimbalzo
+    - MACD cross rialzista (singola barra)
+    - Prezzo risale sopra EMA20 con momentum +0.3%
     """
     cover = pd.Series(False, index=df.index)
 
     # RSI ipervenduto + inizio rimbalzo
-    cover |= (df["rsi"] < 25) & (df["rsi_slope"] > 0)
+    cover |= (df["rsi_fast"] < 35) & (df["rsi_slope"] > 2)
 
-    # MACD cross rialzista confermato (gap in aumento per 2 barre consecutive)
-    macd_gap = df["macd"] - df["macd_signal"]
-    cover |= (macd_gap > 0) & (macd_gap.diff() > 0) & (macd_gap.shift(1).diff() > 0)
+    # MACD cross rialzista (singola barra, reattivo per scalping)
+    macd_gap = df["macd_fast"] - df["macd_signal_fast"]
+    cover |= (macd_gap > 0) & (macd_gap.diff() > 0)
 
-    # Prezzo risale sopra EMA20 con momentum significativo (0.8%)
-    cover |= (df["trend_up"] == 1) & (df["price_change"] > 0.008)
+    # Prezzo risale sopra EMA20 con momentum (+0.3%)
+    cover |= (df["trend_up"] == 1) & (df["price_change"] > 0.003)
 
     return cover
 
@@ -529,10 +491,10 @@ def _train_single_model(X_train, y_train, X_test, y_test, hp, prev_model, min_sa
     """
     neg_count = (y_train == 0).sum()
     pos_count = (y_train == 1).sum()
-    spw = min(neg_count / pos_count, 50.0) if pos_count > 0 else 1.0
+    spw = min(neg_count / pos_count, 30.0) if pos_count > 0 else 1.0
 
     mdl = XGBClassifier(
-        n_estimators=500,
+        n_estimators=800,
         max_depth=hp["max_depth"],
         learning_rate=hp["learning_rate"],
         min_child_weight=hp["min_child_weight"],
@@ -543,7 +505,7 @@ def _train_single_model(X_train, y_train, X_test, y_test, hp, prev_model, min_sa
         scale_pos_weight=spw,
         eval_metric="logloss",
         verbosity=0,
-        early_stopping_rounds=80
+        early_stopping_rounds=50
     )
     mdl.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
 
@@ -773,14 +735,12 @@ def backtest(df_raw, df_feat, model_buy, model_short=None, pred_series=None, tes
         predictions = model_buy.predict(df_test[FEATURES]) - 1
         pred_series = pd.Series(predictions, index=feat_index)
 
-    # Filtro trend: blocca BUY quando prezzo < EMA20, blocca SHORT quando prezzo > EMA20
-    trend_up = df_feat.loc[feat_index, "trend_up"]
+    # Filtro trend: usa trend 1h come direzionale (scalping con contesto)
+    trend_1h_series = df_feat.loc[feat_index, "trend_1h"]
     # ATR per trailing stop (in unita' prezzo)
     atr_series = df_feat.loc[feat_index, "atr"]
-    # 15m momentum per filtro conferma ingresso
-    mom_15m_series = df_feat.loc[feat_index, "mom_15m"]
-    # ADX per filtro SHORT
-    adx_series = df_feat.loc[feat_index, "adx"]
+    # ADX 1h per filtro SHORT
+    adx_1h_series = df_feat.loc[feat_index, "adx_1h"]
 
     class MLStrategy(Strategy):
         def init(self):
@@ -788,21 +748,17 @@ def backtest(df_raw, df_feat, model_buy, model_short=None, pred_series=None, tes
                 lambda: pred_series.reindex(raw_aligned.index).fillna(0).values,
                 name="ML Signal"
             )
-            self.trend = self.I(
-                lambda: trend_up.reindex(raw_aligned.index).fillna(0).values,
-                name="Trend"
+            self.trend_1h = self.I(
+                lambda: trend_1h_series.reindex(raw_aligned.index).fillna(0).values,
+                name="Trend1h"
             )
             self.atr = self.I(
                 lambda: atr_series.reindex(raw_aligned.index).fillna(0).values,
                 name="ATR"
             )
-            self.mom_15m = self.I(
-                lambda: mom_15m_series.reindex(raw_aligned.index).fillna(0).values,
-                name="Mom15m"
-            )
-            self.adx = self.I(
-                lambda: adx_series.reindex(raw_aligned.index).fillna(0).values,
-                name="ADX"
+            self.adx_1h = self.I(
+                lambda: adx_1h_series.reindex(raw_aligned.index).fillna(0).values,
+                name="ADX1h"
             )
             self.entry_price = None
             self.trail_stop = None
@@ -811,18 +767,33 @@ def backtest(df_raw, df_feat, model_buy, model_short=None, pred_series=None, tes
         def next(self):
             sig = self.signal[-1]
             price = self.data.Close[-1]
-            trend_ok = self.trend[-1] == 1
+            trend_ok = self.trend_1h[-1] == 1
             cur_atr = self.atr[-1] / price_divisor if price_divisor > 1 else self.atr[-1]
 
-            # --- Stop loss / Trailing stop LONG ---
+            # --- TAKE PROFIT LONG (scalping: 0.6%) ---
+            if self.position.is_long and self.entry_price:
+                pnl_pct = (price - self.entry_price) / self.entry_price
+                if pnl_pct >= TAKE_PROFIT:
+                    self.position.close()
+                    self._reset()
+                    return
+
+            # --- TAKE PROFIT SHORT (scalping: 0.6%) ---
+            if self.position.is_short and self.entry_price:
+                pnl_pct = (self.entry_price - price) / self.entry_price
+                if pnl_pct >= TAKE_PROFIT:
+                    self.position.close()
+                    self._reset()
+                    return
+
+            # --- Trailing stop / Stop loss LONG ---
             if self.position.is_long and self.entry_price:
                 self.bars_held += 1
                 pnl_pct = (price - self.entry_price) / self.entry_price
                 if pnl_pct >= TRAIL_ACTIVATE:
-                    # In profitto: attiva trailing stop (ATR-based)
                     new_trail = price - cur_atr * TRAIL_ATR_MULT
                     if self.trail_stop is None:
-                        self.trail_stop = max(new_trail, self.entry_price)  # almeno breakeven
+                        self.trail_stop = max(new_trail, self.entry_price)
                     else:
                         self.trail_stop = max(self.trail_stop, new_trail)
                     if price <= self.trail_stop:
@@ -830,21 +801,19 @@ def backtest(df_raw, df_feat, model_buy, model_short=None, pred_series=None, tes
                         self._reset()
                         return
                 else:
-                    # Non ancora in profitto: stop loss fisso classico
                     if pnl_pct <= -STOP_LOSS:
                         self.position.close()
                         self._reset()
                         return
 
-            # --- Stop loss / Trailing stop SHORT ---
+            # --- Trailing stop / Stop loss SHORT ---
             if self.position.is_short and self.entry_price:
                 self.bars_held += 1
                 pnl_pct = (self.entry_price - price) / self.entry_price
                 if pnl_pct >= TRAIL_ACTIVATE:
-                    # In profitto: attiva trailing stop (ATR-based)
                     new_trail = price + cur_atr * TRAIL_ATR_MULT
                     if self.trail_stop is None:
-                        self.trail_stop = min(new_trail, self.entry_price)  # almeno breakeven
+                        self.trail_stop = min(new_trail, self.entry_price)
                     else:
                         self.trail_stop = min(self.trail_stop, new_trail)
                     if price >= self.trail_stop:
@@ -852,29 +821,22 @@ def backtest(df_raw, df_feat, model_buy, model_short=None, pred_series=None, tes
                         self._reset()
                         return
                 else:
-                    # Non ancora in profitto: stop loss fisso classico
                     if pnl_pct <= -SHORT_STOP_LOSS:
                         self.position.close()
                         self._reset()
                         return
 
-            # OPEN LONG: sig == +1, flat, trend up, 15m momentum positivo (se disponibile)
+            # OPEN LONG: sig == +1, flat, trend 1h up
             if sig == 1 and not self.position and trend_ok:
-                m15 = self.mom_15m[-1]
-                if m15 != 0 and m15 < 0:
-                    return  # momentum 15m reale e negativo → skip (impulso esaurito)
                 self.buy(size=TRADE_SIZE)
                 self.entry_price = price
                 self.trail_stop = None
                 self.bars_held = 0
 
-            # OPEN SHORT: sig == -1, flat, trend down, 15m momentum negativo (se disponibile), ADX forte
+            # OPEN SHORT: sig == -1, flat, trend 1h down, ADX 1h forte
             elif sig == -1 and not self.position and not trend_ok:
-                m15 = self.mom_15m[-1]
-                if m15 != 0 and m15 > 0:
-                    return  # momentum 15m reale e positivo → skip (impulso rialzista)
-                if self.adx[-1] < SHORT_ADX_MIN:
-                    return  # trend troppo debole per SHORT
+                if self.adx_1h[-1] < SHORT_ADX_MIN:
+                    return
                 self.sell(size=SHORT_TRADE_SIZE)
                 self.entry_price = price
                 self.trail_stop = None
@@ -925,7 +887,7 @@ def backtest(df_raw, df_feat, model_buy, model_short=None, pred_series=None, tes
         bt_df,
         MLStrategy,
         cash=INITIAL_CASH,
-        commission=0.001,      # 0.1% commission, uguale a Binance
+        commission=0.0004,     # 0.04% round-trip Futures (0.02% per lato)
         exclusive_orders=True
     )
     stats = bt.run()
@@ -974,12 +936,12 @@ def backtest(df_raw, df_feat, model_buy, model_short=None, pred_series=None, tes
 def get_testnet_exchange(exchange_type="spot"):
     """
     Ritorna un'istanza ccxt connessa al Binance Demo Trading.
+    Scalping: se USE_FUTURES_FOR_BOTH=True, ritorna sempre Futures
+    (fee 0.02% maker vs 0.1% spot — critico per scalping).
     exchange_type: "spot" per LONG, "future" per SHORT.
-    Usa enable_demo_trading() che punta a:
-    - demo-api.binance.com (spot)
-    - demo-fapi.binance.com (futures)
     """
-    if exchange_type == "future":
+    # In modalita' Futures-only, anche i LONG passano per Futures
+    if USE_FUTURES_FOR_BOTH or exchange_type == "future":
         exchange = ccxt.binance({
             "apiKey": TESTNET_API_KEY,
             "secret": TESTNET_SECRET,
@@ -991,7 +953,7 @@ def get_testnet_exchange(exchange_type="spot"):
         })
         exchange.enable_demo_trading(True)
         exchange.load_markets()
-        # Leva 1x: nessun leverage, puro short senza margine amplificato
+        # Leva 1x: nessun leverage, puro trading senza margine amplificato
         try:
             exchange.set_leverage(1, SYMBOL)
             print(f"Futures: leverage impostato a 1x per {SYMBOL}")
@@ -1269,33 +1231,17 @@ def _calc_pnl(price, entry_price, qty, position_type):
 
 def run_bot(model_buy, model_short=None):
     """
-    Loop principale del bot:
-    - LONG su Binance Spot Demo (BUY/SELL)
-    - SHORT su Binance Futures Demo (SELL to open / BUY to close)
-    Ogni SLEEP_SECONDS scarica nuovi dati, genera segnali e piazza ordini.
-
-    Include:
-    - Stop loss automatico (2% per LONG e SHORT)
-    - Filtro trend EMA20 (BUY solo in uptrend, SHORT solo in downtrend)
-    - Retraining periodico ogni RETRAIN_HOURS ore
-    - Persistenza stato su file JSON (position_type: long/short/None)
-    - Notifiche Telegram su trade ed errori
-    - Logging trade su CSV
+    Loop principale del bot scalping:
+    - Futures-only: LONG e SHORT entrambi su Binance Futures Demo (fee 0.02%)
+    - Ciclo ogni 60s: check stop/TP/trailing ogni minuto, segnali ML ogni 5m
+    - Take profit 0.6%, stop loss 0.4%, trailing ATR×1.5
+    - Hold minimo 10 min (2 barre da 5m)
     """
-    # === Exchange setup ===
-    exchange_spot = get_testnet_exchange("spot")
-    exchange_futures = None
+    # === Exchange setup (Futures-only per scalping) ===
+    exchange_futures = get_testnet_exchange("future")
     short_enabled = ENABLE_SHORT and model_short is not None
-    if short_enabled:
-        try:
-            exchange_futures = get_testnet_exchange("future")
-            print("Futures Demo: connesso (leverage 1x)")
-        except Exception as e:
-            print(f"[WARN] Futures non disponibile: {e}. SHORT disabilitato.")
-            short_enabled = False
-
     mode_str = "LONG+SHORT" if short_enabled else "LONG-only"
-    print(f"\nBot avviato su Binance Demo | {SYMBOL} | {TIMEFRAME} | {mode_str}")
+    print(f"\nBot SCALPING avviato su Binance Futures Demo | {SYMBOL} | {TIMEFRAME} | {mode_str}")
     print("=" * 55)
 
     # Carica stato precedente (sopravvive a restart)
@@ -1308,14 +1254,24 @@ def run_bot(model_buy, model_short=None):
     last_status  = time.time()
     STATUS_INTERVAL = 86400
     send_telegram(
-        f"🤖 <b>Bot avviato ({mode_str})</b>\n"
-        f"📈 {SYMBOL} | {TIMEFRAME}\n"
+        f"🤖 <b>Bot SCALPING avviato ({mode_str})</b>\n"
+        f"📈 {SYMBOL} | {TIMEFRAME} | Futures-only\n"
         f"🔄 Retraining ogni {RETRAIN_HOURS}h\n"
-        f"🛡 SL: {STOP_LOSS:.0%} | BUY min: {MIN_PROBA:.0%}"
+        f"🛡 SL: {STOP_LOSS:.1%} | TP: {TAKE_PROFIT:.1%} | BUY min: {MIN_PROBA:.0%}"
         + (f" | SHORT min: {SHORT_MIN_PROBA:.0%}" if short_enabled else "")
     )
 
     consecutive_net_errors = 0
+    # Cache dati e segnali (aggiornati ogni 5m)
+    cached_df_feat = None
+    cached_buy_proba = 0.0
+    cached_short_proba = 0.0
+    cached_buy_signal = False
+    cached_short_signal = False
+    cached_sell_signal = False
+    cached_cover_signal = False
+    cached_price = 0.0
+
     while True:
         try:
             # --- Retraining periodico ---
@@ -1334,53 +1290,56 @@ def run_bot(model_buy, model_short=None):
                     )
                 last_retrain = time.time()
 
-            # --- Fetch dati e segnali ---
-            df      = fetch_ohlcv()
-            save_price_history(df)
-            # Fetch candele 15m fresche (aggiornate ogni ciclo 15min)
-            try:
-                df_15m = fetch_ohlcv(symbol=SYMBOL, timeframe="15m", limit=2000)
-            except Exception as e:
-                print(f"  [WARN] Fetch 15m fallito: {e}")
-                df_15m = None
-            df_feat = build_features(df, df_15m=df_15m)
+            # --- Gate 5m: genera segnali ML solo su chiusura candela 5m ---
+            now = datetime.now(timezone.utc)
+            is_5m_close = (now.minute % 5 == 0)
 
-            last_row   = df_feat[FEATURES].iloc[-1:]
-            buy_proba  = model_buy.predict_proba(last_row)[0][1]
-            buy_signal = buy_proba >= MIN_PROBA
+            if is_5m_close or cached_df_feat is None:
+                df = fetch_ohlcv()
+                save_price_history(df)
+                cached_df_feat = build_features(df)
 
-            short_proba = 0.0
-            short_signal = False
-            if short_enabled and model_short is not None:
-                short_proba = model_short.predict_proba(last_row)[0][1]
-                short_signal = short_proba >= SHORT_MIN_PROBA
+                last_row = cached_df_feat[FEATURES].iloc[-1:]
+                cached_buy_proba = model_buy.predict_proba(last_row)[0][1]
+                cached_buy_signal = cached_buy_proba >= MIN_PROBA
 
-            # Segnali tecnici di chiusura
-            sell_signal  = technical_sell_signal(df_feat).iloc[-1]   # chiudi LONG
-            cover_signal = technical_cover_signal(df_feat).iloc[-1]  # chiudi SHORT
+                cached_short_proba = 0.0
+                cached_short_signal = False
+                if short_enabled and model_short is not None:
+                    cached_short_proba = model_short.predict_proba(last_row)[0][1]
+                    cached_short_signal = cached_short_proba >= SHORT_MIN_PROBA
 
-            # --- Conflict resolution: se entrambi i modelli sparano -> HOLD ---
-            if buy_signal and short_signal:
-                buy_signal = False
-                short_signal = False
-                print(f"  [CONFLICT] BUY ({buy_proba:.0%}) + SHORT ({short_proba:.0%}) -> HOLD")
+                # Segnali tecnici di chiusura
+                cached_sell_signal = technical_sell_signal(cached_df_feat).iloc[-1]
+                cached_cover_signal = technical_cover_signal(cached_df_feat).iloc[-1]
 
-            # --- Mutual exclusion posizione: non aprire opposta se gia' in posizione ---
-            if buy_signal and position_type == "short":
-                buy_signal = False  # non aprire LONG mentre SHORT e' aperto
-            if short_signal and position_type == "long":
-                short_signal = False  # non aprire SHORT mentre LONG e' aperto
+                # Conflict resolution
+                if cached_buy_signal and cached_short_signal:
+                    cached_buy_signal = False
+                    cached_short_signal = False
+                    print(f"  [CONFLICT] BUY ({cached_buy_proba:.0%}) + SHORT ({cached_short_proba:.0%}) -> HOLD")
 
-            # --- Balance (dall'exchange corretto) ---
+                # Mutual exclusion
+                if cached_buy_signal and position_type == "short":
+                    cached_buy_signal = False
+                if cached_short_signal and position_type == "long":
+                    cached_short_signal = False
+
+            # Usa segnali cached
+            buy_signal = cached_buy_signal
+            short_signal = cached_short_signal
+            sell_signal = cached_sell_signal
+            cover_signal = cached_cover_signal
+            buy_proba = cached_buy_proba
+            short_proba = cached_short_proba
+            df_feat = cached_df_feat
+
+            # --- Balance (Futures-only) ---
             price = df_feat["close"].iloc[-1]
-            if position_type == "short" and exchange_futures:
-                balance = exchange_futures.fetch_balance()
-                usdt = balance.get("USDT", {}).get("free", 0)
-                btc = 0.0  # su Futures il BTC non e' nel wallet come su Spot
-            else:
-                balance = exchange_spot.fetch_balance()
-                usdt = balance["USDT"]["free"]
-                btc  = balance["BTC"]["free"]
+            cached_price = price
+            balance = exchange_futures.fetch_balance()
+            usdt = balance.get("USDT", {}).get("free", 0)
+            btc = 0.0  # Futures: posizione tracciata via entry_qty
 
             # --- Log stato ---
             pos_str = f"{position_type.upper()}" if position_type else "FLAT"
@@ -1396,7 +1355,7 @@ def run_bot(model_buy, model_short=None):
                 f"USDT: {usdt:.2f}"
             )
 
-            # --- Variabili per tracking azione/motivo (aggiornate sotto) ---
+            # --- Variabili per tracking azione/motivo ---
             dash_action = "HOLD"
             dash_reason = ""
             features_dict = df_feat[FEATURES].iloc[-1].to_dict()
@@ -1432,20 +1391,87 @@ def run_bot(model_buy, model_short=None):
                 last_status = time.time()
 
             # ============================================
-            # TRAILING STOP (SEMPRE attivo, prima di tutto)
+            # TAKE PROFIT (scalping — priorita' massima)
             # ============================================
             cur_atr = df_feat["atr"].iloc[-1] if len(df_feat) > 0 else 0
 
-            # Stop loss / Trailing stop LONG
-            if position_type == "long" and entry_price and btc > 0.0001:
+            if position_type == "long" and entry_price:
+                pnl_pct_now = (price - entry_price) / entry_price
+                if pnl_pct_now >= TAKE_PROFIT:
+                    qty = entry_qty or 0
+                    pnl_usd = (price - entry_price) * qty
+                    try:
+                        exchange_futures.create_order(SYMBOL, "market", "sell", qty)
+                    except Exception as e:
+                        print(f"  [ERRORE] TP LONG fallito: {e}")
+                        send_telegram(f"🚨 <b>TP LONG fallito</b>\n<code>{e}</code>")
+                        continue
+                    dash_action = "TAKE_PROFIT_LONG"
+                    dash_reason = f"TP {pnl_pct_now:.2%} >= {TAKE_PROFIT:.1%}"
+                    entry_price = None; entry_qty = None; entry_time = None; position_type = None; trail_stop = None
+                    save_state(entry_price, entry_qty, entry_time, position_type, trail_stop)
+                    print(f"  -> TAKE PROFIT LONG: SELL {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
+                    log_trade("SELL(TP)", qty, price, "TAKE_PROFIT", buy_proba, pnl_usd)
+                    send_telegram(
+                        f"🎯 <b>TAKE PROFIT LONG</b>\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"🔴 SELL {qty} BTC @ ${price:,.2f}\n"
+                        f"📈 P&amp;L: {pnl_pct_now:.2%} | ${pnl_usd:+,.2f}"
+                    )
+                    try:
+                        save_dashboard_data(price, buy_proba, signal_str, usdt, btc,
+                            None, None, features_dict, short_proba, None,
+                            dash_action, dash_reason)
+                    except Exception:
+                        pass
+                    time.sleep(SLEEP_SECONDS)
+                    continue
+
+            if position_type == "short" and entry_price:
+                pnl_pct_now = (entry_price - price) / entry_price
+                if pnl_pct_now >= TAKE_PROFIT:
+                    qty = entry_qty or 0
+                    pnl_usd = (entry_price - price) * qty
+                    try:
+                        exchange_futures.create_order(SYMBOL, "market", "buy", qty)
+                    except Exception as e:
+                        print(f"  [ERRORE] TP SHORT fallito: {e}")
+                        send_telegram(f"🚨 <b>TP SHORT fallito</b>\n<code>{e}</code>")
+                        continue
+                    dash_action = "TAKE_PROFIT_SHORT"
+                    dash_reason = f"TP {pnl_pct_now:.2%} >= {TAKE_PROFIT:.1%}"
+                    entry_price = None; entry_qty = None; entry_time = None; position_type = None; trail_stop = None
+                    save_state(entry_price, entry_qty, entry_time, position_type, trail_stop)
+                    print(f"  -> TAKE PROFIT SHORT: BUY {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
+                    log_trade("BUY(TP)", qty, price, "TAKE_PROFIT", short_proba, pnl_usd)
+                    send_telegram(
+                        f"🎯 <b>TAKE PROFIT SHORT</b>\n"
+                        f"━━━━━━━━━━━━━━━\n"
+                        f"🟢 BUY(cover) {qty} BTC @ ${price:,.2f}\n"
+                        f"📈 P&amp;L: {pnl_pct_now:.2%} | ${pnl_usd:+,.2f}"
+                    )
+                    try:
+                        save_dashboard_data(price, buy_proba, signal_str, usdt, btc,
+                            None, None, features_dict, short_proba, None,
+                            dash_action, dash_reason)
+                    except Exception:
+                        pass
+                    time.sleep(SLEEP_SECONDS)
+                    continue
+
+            # ============================================
+            # TRAILING STOP / STOP LOSS
+            # ============================================
+
+            # Trailing stop / Stop loss LONG
+            if position_type == "long" and entry_price:
                 pnl_pct_now = (price - entry_price) / entry_price
                 stop_triggered = False
 
                 if pnl_pct_now >= TRAIL_ACTIVATE:
-                    # In profitto >= 1%: attiva/aggiorna trailing stop
                     new_trail = price - cur_atr * TRAIL_ATR_MULT
                     if trail_stop is None:
-                        trail_stop = max(new_trail, entry_price)  # almeno breakeven
+                        trail_stop = max(new_trail, entry_price)
                     else:
                         trail_stop = max(trail_stop, new_trail)
                     save_state(entry_price, entry_qty, entry_time, position_type, trail_stop)
@@ -1454,17 +1480,16 @@ def run_bot(model_buy, model_short=None):
                         dash_action = "TRAIL_STOP_LONG"
                         dash_reason = f"Price ${price:,.0f} <= trail ${trail_stop:,.0f} (ATR×{TRAIL_ATR_MULT})"
                 else:
-                    # Non in profitto: stop loss fisso classico
                     if pnl_pct_now <= -STOP_LOSS:
                         stop_triggered = True
                         dash_action = "STOP_LOSS_LONG"
-                        dash_reason = f"Loss {pnl_pct_now:.2%} <= -{STOP_LOSS:.0%}"
+                        dash_reason = f"Loss {pnl_pct_now:.2%} <= -{STOP_LOSS:.1%}"
 
                 if stop_triggered:
-                    qty = int(btc * 1e6) / 1e6
+                    qty = entry_qty or 0
                     pnl_usd = (price - entry_price) * qty
                     try:
-                        exchange_spot.create_order(SYMBOL, "market", "sell", qty)
+                        exchange_futures.create_order(SYMBOL, "market", "sell", qty)
                     except Exception as e:
                         print(f"  [ERRORE] Stop LONG fallito: {e}")
                         send_telegram(f"🚨 <b>Stop LONG fallito</b>\n<code>{e}</code>")
@@ -1486,18 +1511,17 @@ def run_bot(model_buy, model_short=None):
                     except Exception:
                         pass
                     time.sleep(SLEEP_SECONDS)
-                    continue  # NON aprire nuove posizioni nello stesso ciclo
+                    continue
 
-            # Stop loss / Trailing stop SHORT
-            if position_type == "short" and entry_price and exchange_futures:
+            # Trailing stop / Stop loss SHORT
+            if position_type == "short" and entry_price:
                 pnl_pct_now = (entry_price - price) / entry_price
                 stop_triggered = False
 
                 if pnl_pct_now >= TRAIL_ACTIVATE:
-                    # In profitto >= 1%: attiva/aggiorna trailing stop
                     new_trail = price + cur_atr * TRAIL_ATR_MULT
                     if trail_stop is None:
-                        trail_stop = min(new_trail, entry_price)  # almeno breakeven
+                        trail_stop = min(new_trail, entry_price)
                     else:
                         trail_stop = min(trail_stop, new_trail)
                     save_state(entry_price, entry_qty, entry_time, position_type, trail_stop)
@@ -1506,11 +1530,10 @@ def run_bot(model_buy, model_short=None):
                         dash_action = "TRAIL_STOP_SHORT"
                         dash_reason = f"Price ${price:,.0f} >= trail ${trail_stop:,.0f} (ATR×{TRAIL_ATR_MULT})"
                 else:
-                    # Non in profitto: stop loss fisso classico
                     if pnl_pct_now <= -SHORT_STOP_LOSS:
                         stop_triggered = True
                         dash_action = "STOP_LOSS_SHORT"
-                        dash_reason = f"Loss {pnl_pct_now:.2%} <= -{SHORT_STOP_LOSS:.0%}"
+                        dash_reason = f"Loss {pnl_pct_now:.2%} <= -{SHORT_STOP_LOSS:.1%}"
 
                 if stop_triggered:
                     qty = entry_qty or 0
@@ -1541,77 +1564,70 @@ def run_bot(model_buy, model_short=None):
                     continue
 
             # ============================================
-            # HOLD MINIMO (sopprime chiusura tecnica)
+            # HOLD MINIMO (sopprime chiusura tecnica, in minuti per scalping)
             # ============================================
             if sell_signal and position_type == "long" and entry_time:
-                hours_held = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
-                if hours_held < MIN_HOLD_BARS:
+                mins_held = (datetime.now(timezone.utc) - entry_time).total_seconds() / 60
+                bars_held = mins_held / 5  # 1 barra = 5 minuti
+                if bars_held < MIN_HOLD_BARS:
                     sell_signal = False
-                    dash_reason = f"CLOSE soppresso: hold {hours_held:.1f}h < {MIN_HOLD_BARS}h min"
-                    print(f"  -> CLOSE LONG soppresso: hold {hours_held:.1f}h < {MIN_HOLD_BARS}h")
+                    dash_reason = f"CLOSE soppresso: hold {mins_held:.0f}m < {MIN_HOLD_BARS * 5}m min"
+                    print(f"  -> CLOSE LONG soppresso: hold {mins_held:.0f}m < {MIN_HOLD_BARS * 5}m")
 
             if cover_signal and position_type == "short" and entry_time:
-                hours_held = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
-                if hours_held < SHORT_MIN_HOLD:
+                mins_held = (datetime.now(timezone.utc) - entry_time).total_seconds() / 60
+                bars_held = mins_held / 5
+                if bars_held < SHORT_MIN_HOLD:
                     cover_signal = False
-                    dash_reason = f"COVER soppresso: hold {hours_held:.1f}h < {SHORT_MIN_HOLD}h min"
-                    print(f"  -> CLOSE SHORT soppresso: hold {hours_held:.1f}h < {SHORT_MIN_HOLD}h")
+                    dash_reason = f"COVER soppresso: hold {mins_held:.0f}m < {SHORT_MIN_HOLD * 5}m min"
+                    print(f"  -> CLOSE SHORT soppresso: hold {mins_held:.0f}m < {SHORT_MIN_HOLD * 5}m")
 
             # ============================================
-            # APERTURA POSIZIONI (solo se flat)
+            # APERTURA POSIZIONI (solo se flat, solo su chiusura candela 5m)
             # ============================================
 
-            # Leggi filtri 15m e ADX per ingresso
-            mom_15m_val = df_feat["mom_15m"].iloc[-1] if "mom_15m" in df_feat.columns else 0
-            adx_val = df_feat["adx"].iloc[-1] if "adx" in df_feat.columns else 0
+            # Leggi filtro trend 1h e ADX 1h
+            trend_1h_val = df_feat["trend_1h"].iloc[-1] if "trend_1h" in df_feat.columns else 0
+            adx_1h_val = df_feat["adx_1h"].iloc[-1] if "adx_1h" in df_feat.columns else 0
 
-            if buy_signal and usdt > 10 and not position_type:
-                trend_ok = df_feat["trend_up"].iloc[-1] == 1
-                if not trend_ok:
+            if is_5m_close and buy_signal and usdt > 10 and not position_type:
+                if trend_1h_val != 1:
                     dash_action = "BUY_BLOCKED"
-                    dash_reason = f"Trend DOWN (prezzo < EMA20), BUY {buy_proba:.0%} bloccato"
-                    print(f"  -> Trend ribassista (prezzo < EMA20), BUY bloccato.")
-                elif mom_15m_val != 0 and mom_15m_val < 0:
-                    dash_action = "BUY_BLOCKED"
-                    dash_reason = f"Mom 15m {mom_15m_val:.4f} < 0, impulso esaurito"
-                    print(f"  -> BUY bloccato: momentum 15m negativo ({mom_15m_val:.4f})")
+                    dash_reason = f"Trend 1h DOWN, BUY {buy_proba:.0%} bloccato"
+                    print(f"  -> Trend 1h ribassista, BUY bloccato.")
                 else:
                     qty = round((usdt * TRADE_SIZE) / price, 6)
                     try:
-                        exchange_spot.create_order(SYMBOL, "market", "buy", qty)
+                        exchange_futures.create_order(SYMBOL, "market", "buy", qty)
                     except Exception as e:
                         print(f"  [ERRORE] BUY fallito: {e}")
                         send_telegram(f"🚨 <b>BUY fallito</b>\n<code>{e}</code>")
                         continue
                     dash_action = "OPEN_LONG"
-                    dash_reason = f"BUY {buy_proba:.0%} >= {MIN_PROBA:.0%}, trend UP, mom15m OK"
+                    dash_reason = f"BUY {buy_proba:.0%} >= {MIN_PROBA:.0%}, trend 1h UP"
                     entry_price = price; entry_qty = qty; trail_stop = None
                     entry_time = datetime.now(timezone.utc); position_type = "long"
                     save_state(entry_price, entry_qty, entry_time, position_type, trail_stop)
-                    print(f"  -> ORDER: BUY {qty} BTC @ {price:.2f} (prob: {buy_proba:.0%}, mom15m: {mom_15m_val:.4f})")
+                    print(f"  -> ORDER: BUY {qty} BTC @ {price:.2f} (prob: {buy_proba:.0%})")
                     log_trade("BUY", qty, price, "BUY", buy_proba)
                     send_telegram(
-                        f"🟢 <b>BUY eseguito</b>\n"
+                        f"🟢 <b>BUY eseguito (scalp)</b>\n"
                         f"━━━━━━━━━━━━━━━\n"
                         f"🛒 {qty} BTC @ ${price:,.2f}\n"
                         f"🤖 Confidenza: {buy_proba:.0%}\n"
-                        f"💵 Investito: ${qty * price:,.2f}"
+                        f"💵 Investito: ${qty * price:,.2f}\n"
+                        f"🎯 TP: {TAKE_PROFIT:.1%} | SL: {STOP_LOSS:.1%}"
                     )
 
-            elif short_signal and short_enabled and usdt > 10 and not position_type:
-                trend_down = df_feat["trend_up"].iloc[-1] == 0
-                if not trend_down:
+            elif is_5m_close and short_signal and short_enabled and usdt > 10 and not position_type:
+                if trend_1h_val != 0:
                     dash_action = "SHORT_BLOCKED"
-                    dash_reason = f"Trend UP (prezzo > EMA20), SHORT {short_proba:.0%} bloccato"
-                    print(f"  -> Trend rialzista (prezzo > EMA20), SHORT bloccato.")
-                elif mom_15m_val != 0 and mom_15m_val > 0:
+                    dash_reason = f"Trend 1h UP, SHORT {short_proba:.0%} bloccato"
+                    print(f"  -> Trend 1h rialzista, SHORT bloccato.")
+                elif adx_1h_val < SHORT_ADX_MIN:
                     dash_action = "SHORT_BLOCKED"
-                    dash_reason = f"Mom 15m {mom_15m_val:.4f} > 0, impulso ribassista assente"
-                    print(f"  -> SHORT bloccato: momentum 15m positivo ({mom_15m_val:.4f})")
-                elif adx_val < SHORT_ADX_MIN:
-                    dash_action = "SHORT_BLOCKED"
-                    dash_reason = f"ADX {adx_val:.1f} < {SHORT_ADX_MIN}, trend troppo debole"
-                    print(f"  -> SHORT bloccato: ADX {adx_val:.1f} < {SHORT_ADX_MIN} (trend debole)")
+                    dash_reason = f"ADX 1h {adx_1h_val:.1f} < {SHORT_ADX_MIN}, trend debole"
+                    print(f"  -> SHORT bloccato: ADX 1h {adx_1h_val:.1f} < {SHORT_ADX_MIN}")
                 else:
                     qty = round((usdt * SHORT_TRADE_SIZE) / price, 6)
                     try:
@@ -1621,29 +1637,30 @@ def run_bot(model_buy, model_short=None):
                         send_telegram(f"🚨 <b>SHORT fallito</b>\n<code>{e}</code>")
                         continue
                     dash_action = "OPEN_SHORT"
-                    dash_reason = f"SHORT {short_proba:.0%} >= {SHORT_MIN_PROBA:.0%}, trend DOWN, ADX {adx_val:.0f}"
+                    dash_reason = f"SHORT {short_proba:.0%} >= {SHORT_MIN_PROBA:.0%}, trend 1h DOWN, ADX {adx_1h_val:.0f}"
                     entry_price = price; entry_qty = qty; trail_stop = None
                     entry_time = datetime.now(timezone.utc); position_type = "short"
                     save_state(entry_price, entry_qty, entry_time, position_type, trail_stop)
-                    print(f"  -> ORDER: SHORT {qty} BTC @ {price:.2f} (prob: {short_proba:.0%}, ADX: {adx_val:.0f})")
+                    print(f"  -> ORDER: SHORT {qty} BTC @ {price:.2f} (prob: {short_proba:.0%}, ADX 1h: {adx_1h_val:.0f})")
                     log_trade("SHORT", qty, price, "SHORT", short_proba)
                     send_telegram(
-                        f"🔴 <b>SHORT eseguito</b>\n"
+                        f"🔴 <b>SHORT eseguito (scalp)</b>\n"
                         f"━━━━━━━━━━━━━━━\n"
                         f"📉 {qty} BTC @ ${price:,.2f}\n"
                         f"🤖 Confidenza: {short_proba:.0%}\n"
-                        f"💵 Margine: ${qty * price:,.2f}"
+                        f"💵 Margine: ${qty * price:,.2f}\n"
+                        f"🎯 TP: {TAKE_PROFIT:.1%} | SL: {SHORT_STOP_LOSS:.1%}"
                     )
 
             # ============================================
             # CHIUSURA POSIZIONI (segnali tecnici)
             # ============================================
 
-            elif sell_signal and position_type == "long" and btc > 0.0001:
-                qty = int(btc * 1e6) / 1e6
+            elif sell_signal and position_type == "long":
+                qty = entry_qty or 0
                 pnl_usd, pnl_pct = _calc_pnl(price, entry_price, qty, "long")
                 try:
-                    exchange_spot.create_order(SYMBOL, "market", "sell", qty)
+                    exchange_futures.create_order(SYMBOL, "market", "sell", qty)
                 except Exception as e:
                     print(f"  [ERRORE] CLOSE LONG fallito: {e}")
                     send_telegram(f"🚨 <b>CLOSE LONG fallito</b>\n<code>{e}</code>")
@@ -1662,7 +1679,7 @@ def run_bot(model_buy, model_short=None):
                     f"{pnl_icon} P&amp;L: {pnl_pct:+.2%} (${pnl_usd:+,.2f})"
                 )
 
-            elif cover_signal and position_type == "short" and exchange_futures:
+            elif cover_signal and position_type == "short":
                 qty = entry_qty or 0
                 pnl_usd, pnl_pct = _calc_pnl(price, entry_price, qty, "short")
                 try:
@@ -1693,9 +1710,10 @@ def run_bot(model_buy, model_short=None):
                     dash_reason = f"Confidenza bassa (BUY {buy_proba:.0%} < {MIN_PROBA:.0%}, SHORT {short_proba:.0%} < {SHORT_MIN_PROBA:.0%})"
                 else:
                     dash_reason = "Nessun segnale attivo"
-                print(f"  -> HOLD (nessuna azione)")
+                if is_5m_close:
+                    print(f"  -> HOLD (nessuna azione)")
 
-            # --- Dashboard save (fine ciclo, con action/reason) ---
+            # --- Dashboard save (fine ciclo) ---
             try:
                 save_dashboard_data(
                     price, buy_proba, signal_str, usdt, btc,
@@ -1755,7 +1773,7 @@ def run_bot(model_buy, model_short=None):
             )
             consecutive_net_errors = 0
 
-        print(f"  -> Prossimo ciclo tra {SLEEP_SECONDS // 60} minuti...\n")
+        print(f"  -> Prossimo ciclo tra {SLEEP_SECONDS}s...\n")
         time.sleep(SLEEP_SECONDS)
 
 

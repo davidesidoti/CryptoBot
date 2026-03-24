@@ -140,7 +140,7 @@
 
     <!-- Candlestick Chart -->
     <div class="card p-4 mb-6">
-        <div class="text-sm font-medium text-gray-300 mb-3">Grafico BTC/USDT (1h)</div>
+        <div class="text-sm font-medium text-gray-300 mb-3">Grafico BTC/USDT (5m)</div>
         <div id="candlestick-container" style="height: 350px;">
             <div id="candle-placeholder" class="flex items-center justify-center h-full text-gray-500 text-sm">
                 Caricamento candele...
@@ -256,7 +256,7 @@
 
     <!-- Footer -->
     <div class="text-center text-xs text-gray-600 mt-6">
-        Auto-refresh ogni 30s &nbsp;|&nbsp; CryptoBot Dashboard
+        Auto-refresh ogni 10s &nbsp;|&nbsp; CryptoBot Scalping Dashboard
     </div>
 
 <script>
@@ -271,7 +271,7 @@
     let prevValues = {};         // previous numeric values for count-up
     let animFrames = {};         // active requestAnimationFrame IDs
     let lastTimestamp = null;    // last bot update timestamp (ms)
-    let sleepSeconds = 900;      // default, updated from API
+    let sleepSeconds = 60;       // scalping: ciclo ogni 60s
     let prevTradeCount = null;   // for toast detection
     let lastStatusData = null;   // for activity feed current signal
 
@@ -413,7 +413,7 @@
             // Timestamp & countdown state
             const ts = new Date(d.timestamp);
             lastTimestamp = ts.getTime();
-            sleepSeconds = d.sleep_seconds || 900;
+            sleepSeconds = d.sleep_seconds || 60;
 
             const age = Math.floor((Date.now() - ts.getTime()) / 1000);
 
@@ -882,7 +882,7 @@
         ]);
     }
     refresh();
-    setInterval(refresh, 30000);
+    setInterval(refresh, 10000);
 </script>
 </body>
 </html>

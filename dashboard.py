@@ -59,12 +59,14 @@ def equity():
         for row in reader:
             rows.append(row)
 
-    # Costruisci equity curve dai SELL (hanno pnl_usd)
+    # Costruisci equity curve da tutti i trade chiusi (SELL, COVER, TP, TS, SL)
     equity = 500.0  # INITIAL_CASH
     curve = [{"timestamp": "", "equity": equity}]
+    close_sides = ("SELL", "SELL(TP)", "SELL(TS)", "SELL(SL)",
+                   "COVER", "BUY(TP)", "BUY(TS)", "BUY(SL)")
     for row in rows:
         pnl = row.get("pnl_usd", "")
-        if pnl and row.get("side", "").startswith("SELL"):
+        if pnl and row.get("side", "") in close_sides:
             equity += float(pnl)
             curve.append({
                 "timestamp": row["timestamp"],
