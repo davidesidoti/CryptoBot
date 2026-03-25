@@ -1355,6 +1355,17 @@ def run_bot(model_buy, model_short=None):
                 f"USDT: {usdt:.2f}"
             )
 
+            # --- Diagnostica dettagliata su chiusura candela 5m ---
+            if is_5m_close:
+                trend_1h_diag = df_feat["trend_1h"].iloc[-1] if "trend_1h" in df_feat.columns else "N/A"
+                adx_1h_diag = df_feat["adx_1h"].iloc[-1] if "adx_1h" in df_feat.columns else 0
+                trend_str = "UP" if trend_1h_diag == 1 else "DOWN"
+                print(
+                    f"  [DIAG] BUY_proba: {buy_proba:.2%} (soglia {MIN_PROBA:.0%}) | "
+                    f"SHORT_proba: {short_proba:.2%} (soglia {SHORT_MIN_PROBA:.0%}) | "
+                    f"Trend_1h: {trend_str} | ADX_1h: {adx_1h_diag:.1f}"
+                )
+
             # --- Variabili per tracking azione/motivo ---
             dash_action = "HOLD"
             dash_reason = ""
