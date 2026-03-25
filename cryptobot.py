@@ -1200,19 +1200,29 @@ def load_model():
 def retrain_model():
     """
     Scarica dati freschi, rigenera feature, allena nuovi modelli (BUY + SHORT)
-    e li salva su disco. Usato per il retraining periodico nel bot live.
+    usando walk-forward + iperparametri Optuna (come il training iniziale).
+    Usato per il retraining periodico nel bot live.
     """
     print("\n=== RETRAINING: scarico dati freschi ===")
     df_raw = fetch_ohlcv()
+    save_price_history(df_raw)
     df_feat = build_features(df_raw)
     print(f"Retraining su {len(df_feat)} righe")
-    model_buy = train_model(df_feat)
-    model_short = None
+
+    # Carica iperparametri Optuna (o ri-ottimizza se cache scaduta)
+    best_params_buy = optimize_hyperparams(df_feat, target_label=1, cache_file=OPTUNA_BUY_FILE)
+    best_params_short = None
     if ENABLE_SHORT:
-        model_short = train_model(df_feat, target_label=-1)
+        best_params_short = optimize_hyperparams(df_feat, target_label=-1, cache_file=OPTUNA_SHORT_FILE)
+
+    # Walk-forward training (come il training iniziale)
+    model_buy, model_short, _ = walk_forward_train(
+        df_feat, best_params_buy=best_params_buy, best_params_short=best_params_short
+    )
+
     save_model(model_buy, model_short)
     send_telegram(
-        f"🔄 <b>Retraining completato</b>\n"
+        f"🔄 <b>Retraining completato (walk-forward + Optuna)</b>\n"
         f"📊 Righe: {len(df_feat)} | BUY + {'SHORT' if model_short else 'LONG-only'}"
     )
     return model_buy, model_short
