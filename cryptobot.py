@@ -755,6 +755,44 @@ def walk_forward_train(df, best_params_buy=None, best_params_short=None):
     else:
         final_short_model = None
 
+    # === Auto-calibrazione soglie ensemble ===
+    # L'ensemble media le probabilita' di piu' modelli, comprimendo il range.
+    # Soglie calibrate per singolo modello (58%/60%) non funzionano per l'ensemble.
+    # Calcoliamo le soglie che producono lo stesso numero di segnali del backtest per-fold.
+    X_oos = X.loc[all_idx]  # tutti i dati out-of-sample
+    n_buy_signals_pf = int(n_open_long)   # segnali dal backtest per-fold
+
+    ens_buy_proba = final_buy_model.predict_proba(X_oos)[:, 1]
+    # Ordina le probabilita' in ordine decrescente e prendi la soglia che produce n_buy_signals_pf segnali
+    sorted_buy = np.sort(ens_buy_proba)[::-1]
+    if n_buy_signals_pf > 0 and n_buy_signals_pf < len(sorted_buy):
+        cal_buy_thresh = float(sorted_buy[n_buy_signals_pf - 1])
+        # Clamp: non scendere sotto 0.30 e non superare MIN_PROBA originale
+        cal_buy_thresh = max(0.30, min(cal_buy_thresh, MIN_PROBA))
+    else:
+        cal_buy_thresh = MIN_PROBA
+    print(f"\n  [CALIBRAZIONE] BUY: {n_buy_signals_pf} segnali per-fold -> "
+          f"soglia ensemble = {cal_buy_thresh:.2%} (era {MIN_PROBA:.0%})")
+
+    cal_short_thresh = SHORT_MIN_PROBA
+    if short_enabled and final_short_model is not None:
+        n_short_signals_pf = int(n_open_short)
+        ens_short_proba = final_short_model.predict_proba(X_oos)[:, 1]
+        sorted_short = np.sort(ens_short_proba)[::-1]
+        if n_short_signals_pf > 0 and n_short_signals_pf < len(sorted_short):
+            cal_short_thresh = float(sorted_short[n_short_signals_pf - 1])
+            cal_short_thresh = max(0.30, min(cal_short_thresh, SHORT_MIN_PROBA))
+        else:
+            cal_short_thresh = SHORT_MIN_PROBA
+        print(f"  [CALIBRAZIONE] SHORT: {n_short_signals_pf} segnali per-fold -> "
+              f"soglia ensemble = {cal_short_thresh:.2%} (era {SHORT_MIN_PROBA:.0%})")
+
+    # Salva soglie calibrate nel modello ensemble per uso in run_bot
+    if hasattr(final_buy_model, 'models'):
+        final_buy_model.calibrated_threshold = cal_buy_thresh
+    if final_short_model is not None and hasattr(final_short_model, 'models'):
+        final_short_model.calibrated_threshold = cal_short_thresh
+
     return final_buy_model, final_short_model, pred_series
 
 
@@ -1316,11 +1354,17 @@ def run_bot(model_buy, model_short=None):
         f"🤖 <b>Bot SCALPING avviato ({mode_str})</b>\n"
         f"📈 {SYMBOL} | {TIMEFRAME} | Futures-only\n"
         f"🔄 Retraining ogni {RETRAIN_HOURS}h\n"
-        f"🛡 SL: {STOP_LOSS:.1%} | TP: {TAKE_PROFIT:.1%} | BUY min: {MIN_PROBA:.0%}"
-        + (f" | SHORT min: {SHORT_MIN_PROBA:.0%}" if short_enabled else "")
+        f"🛡 SL: {STOP_LOSS:.1%} | TP: {TAKE_PROFIT:.1%} | BUY min: {eff_buy_thresh:.0%}"
+        + (f" | SHORT min: {eff_short_thresh:.0%}" if short_enabled else "")
     )
 
     consecutive_net_errors = 0
+
+    # Soglie: usa quelle calibrate dall'ensemble se disponibili, altrimenti default
+    eff_buy_thresh = getattr(model_buy, 'calibrated_threshold', MIN_PROBA)
+    eff_short_thresh = getattr(model_short, 'calibrated_threshold', SHORT_MIN_PROBA) if model_short else SHORT_MIN_PROBA
+    print(f"Soglie effettive: BUY >= {eff_buy_thresh:.2%} | SHORT >= {eff_short_thresh:.2%}")
+
     # Cache dati e segnali (aggiornati ogni 5m)
     cached_df_feat = None
     cached_buy_proba = 0.0
@@ -1341,6 +1385,10 @@ def run_bot(model_buy, model_short=None):
                     model_buy, model_short_new = retrain_model()
                     if model_short_new and short_enabled:
                         model_short = model_short_new
+                    # Aggiorna soglie calibrate dopo retrain
+                    eff_buy_thresh = getattr(model_buy, 'calibrated_threshold', MIN_PROBA)
+                    eff_short_thresh = getattr(model_short, 'calibrated_threshold', SHORT_MIN_PROBA) if model_short else SHORT_MIN_PROBA
+                    print(f"  Soglie aggiornate: BUY >= {eff_buy_thresh:.2%} | SHORT >= {eff_short_thresh:.2%}")
                 except Exception as e:
                     print(f"[RETRAIN FALLITO] {e}")
                     send_telegram(
@@ -1360,13 +1408,13 @@ def run_bot(model_buy, model_short=None):
 
                 last_row = cached_df_feat[FEATURES].iloc[-1:]
                 cached_buy_proba = model_buy.predict_proba(last_row)[0][1]
-                cached_buy_signal = cached_buy_proba >= MIN_PROBA
+                cached_buy_signal = cached_buy_proba >= eff_buy_thresh
 
                 cached_short_proba = 0.0
                 cached_short_signal = False
                 if short_enabled and model_short is not None:
                     cached_short_proba = model_short.predict_proba(last_row)[0][1]
-                    cached_short_signal = cached_short_proba >= SHORT_MIN_PROBA
+                    cached_short_signal = cached_short_proba >= eff_short_thresh
 
                 # Segnali tecnici di chiusura
                 cached_sell_signal = technical_sell_signal(cached_df_feat).iloc[-1]
@@ -1420,8 +1468,8 @@ def run_bot(model_buy, model_short=None):
                 adx_1h_diag = df_feat["adx_1h"].iloc[-1] if "adx_1h" in df_feat.columns else 0
                 trend_str = "UP" if trend_1h_diag == 1 else "DOWN"
                 print(
-                    f"  [DIAG] BUY_proba: {buy_proba:.2%} (soglia {MIN_PROBA:.0%}) | "
-                    f"SHORT_proba: {short_proba:.2%} (soglia {SHORT_MIN_PROBA:.0%}) | "
+                    f"  [DIAG] BUY_proba: {buy_proba:.2%} (soglia {eff_buy_thresh:.0%}) | "
+                    f"SHORT_proba: {short_proba:.2%} (soglia {eff_short_thresh:.0%}) | "
                     f"Trend_1h: {trend_str} | ADX_1h: {adx_1h_diag:.1f}"
                 )
 
@@ -1674,7 +1722,7 @@ def run_bot(model_buy, model_short=None):
                         send_telegram(f"🚨 <b>BUY fallito</b>\n<code>{e}</code>")
                         continue
                     dash_action = "OPEN_LONG"
-                    dash_reason = f"BUY {buy_proba:.0%} >= {MIN_PROBA:.0%}, trend 1h UP"
+                    dash_reason = f"BUY {buy_proba:.0%} >= {eff_buy_thresh:.0%}, trend 1h UP"
                     entry_price = price; entry_qty = qty; trail_stop = None
                     entry_time = datetime.now(timezone.utc); position_type = "long"
                     save_state(entry_price, entry_qty, entry_time, position_type, trail_stop)
@@ -1707,7 +1755,7 @@ def run_bot(model_buy, model_short=None):
                         send_telegram(f"🚨 <b>SHORT fallito</b>\n<code>{e}</code>")
                         continue
                     dash_action = "OPEN_SHORT"
-                    dash_reason = f"SHORT {short_proba:.0%} >= {SHORT_MIN_PROBA:.0%}, trend 1h DOWN, ADX {adx_1h_val:.0f}"
+                    dash_reason = f"SHORT {short_proba:.0%} >= {eff_short_thresh:.0%}, trend 1h DOWN, ADX {adx_1h_val:.0f}"
                     entry_price = price; entry_qty = qty; trail_stop = None
                     entry_time = datetime.now(timezone.utc); position_type = "short"
                     save_state(entry_price, entry_qty, entry_time, position_type, trail_stop)
@@ -1776,8 +1824,8 @@ def run_bot(model_buy, model_short=None):
                 # Determina motivo HOLD
                 if position_type:
                     dash_reason = f"In posizione {position_type.upper()}, attesa segnale chiusura"
-                elif buy_proba < MIN_PROBA and short_proba < SHORT_MIN_PROBA:
-                    dash_reason = f"Confidenza bassa (BUY {buy_proba:.0%} < {MIN_PROBA:.0%}, SHORT {short_proba:.0%} < {SHORT_MIN_PROBA:.0%})"
+                elif buy_proba < eff_buy_thresh and short_proba < eff_short_thresh:
+                    dash_reason = f"Confidenza bassa (BUY {buy_proba:.0%} < {eff_buy_thresh:.0%}, SHORT {short_proba:.0%} < {eff_short_thresh:.0%})"
                 else:
                     dash_reason = "Nessun segnale attivo"
                 if is_5m_close:
