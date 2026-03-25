@@ -1350,6 +1350,12 @@ def run_bot(model_buy, model_short=None):
     last_retrain = time.time()
     last_status  = time.time()
     STATUS_INTERVAL = 86400
+
+    # Soglie: usa quelle calibrate dall'ensemble se disponibili, altrimenti default
+    eff_buy_thresh = getattr(model_buy, 'calibrated_threshold', MIN_PROBA)
+    eff_short_thresh = getattr(model_short, 'calibrated_threshold', SHORT_MIN_PROBA) if model_short else SHORT_MIN_PROBA
+    print(f"Soglie effettive: BUY >= {eff_buy_thresh:.2%} | SHORT >= {eff_short_thresh:.2%}")
+
     send_telegram(
         f"🤖 <b>Bot SCALPING avviato ({mode_str})</b>\n"
         f"📈 {SYMBOL} | {TIMEFRAME} | Futures-only\n"
@@ -1359,11 +1365,6 @@ def run_bot(model_buy, model_short=None):
     )
 
     consecutive_net_errors = 0
-
-    # Soglie: usa quelle calibrate dall'ensemble se disponibili, altrimenti default
-    eff_buy_thresh = getattr(model_buy, 'calibrated_threshold', MIN_PROBA)
-    eff_short_thresh = getattr(model_short, 'calibrated_threshold', SHORT_MIN_PROBA) if model_short else SHORT_MIN_PROBA
-    print(f"Soglie effettive: BUY >= {eff_buy_thresh:.2%} | SHORT >= {eff_short_thresh:.2%}")
 
     # Cache dati e segnali (aggiornati ogni 5m)
     cached_df_feat = None
