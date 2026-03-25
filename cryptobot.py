@@ -484,6 +484,34 @@ def technical_cover_signal(df):
     return cover
 
 
+class EnsembleClassifier:
+    """
+    Ensemble di piu' modelli XGBoost: media le probabilita' di N fold.
+    Compatibile con l'interfaccia sklearn (predict_proba, predict, feature_importances_).
+    Usato per il live bot per replicare piu' fedelmente il comportamento walk-forward.
+    """
+    def __init__(self, models, keep_last_n=5):
+        # Tieni solo gli ultimi N modelli non-degeneri
+        self.models = models[-keep_last_n:] if len(models) > keep_last_n else models
+        print(f"  Ensemble creato: {len(self.models)} modelli (da {len(models)} fold validi)")
+
+    def predict_proba(self, X):
+        """Media delle probabilita' di tutti i modelli."""
+        probas = [m.predict_proba(X) for m in self.models]
+        return np.mean(probas, axis=0)
+
+    def predict(self, X):
+        """Predizione basata sulla media delle probabilita' (soglia 0.5)."""
+        avg_proba = self.predict_proba(X)
+        return (avg_proba[:, 1] >= 0.5).astype(int)
+
+    @property
+    def feature_importances_(self):
+        """Media delle feature importance di tutti i modelli."""
+        importances = [m.feature_importances_ for m in self.models]
+        return np.mean(importances, axis=0)
+
+
 def _train_single_model(X_train, y_train, X_test, y_test, hp, prev_model, min_samples=20):
     """
     Allena un singolo XGBClassifier con guard per fold degeneri.
@@ -553,6 +581,9 @@ def walk_forward_train(df, best_params_buy=None, best_params_short=None):
     prev_buy_model = None
     prev_short_model = None
     MIN_SAMPLES = 20
+    # Raccolta modelli validi per ensemble
+    valid_buy_models = []
+    valid_short_models = []
 
     # Iperparametri BUY: Optuna o default
     hp_buy = {
@@ -606,6 +637,12 @@ def walk_forward_train(df, best_params_buy=None, best_params_short=None):
             short_preds = np.zeros(len(X_test), dtype=int)
             short_proba = np.full(len(X_test), 0.0)
             short_degen = True
+
+        # Raccogli modelli validi per ensemble
+        if not buy_degen:
+            valid_buy_models.append(buy_mdl)
+        if short_enabled and not short_degen:
+            valid_short_models.append(short_mdl)
 
         all_buy_preds.extend(buy_preds)
         all_buy_proba.extend(buy_proba)
@@ -702,9 +739,21 @@ def walk_forward_train(df, best_params_buy=None, best_params_short=None):
           f"CLOSE_LONG={n_close_long}, CLOSE_SHORT={n_close_short}, "
           f"HOLD={int((pred_values == 0).sum())}, CONFLITTI={n_conflicts}")
 
-    # Ritorna entrambi i modelli dell'ultimo fold valido
-    final_buy_model = prev_buy_model if prev_buy_model else buy_mdl
-    final_short_model = prev_short_model if (short_enabled and prev_short_model) else (short_mdl if short_enabled else None)
+    # Crea ensemble dagli ultimi N fold validi (piu' rappresentativo del backtest)
+    ENSEMBLE_SIZE = 5
+    if len(valid_buy_models) >= 2:
+        final_buy_model = EnsembleClassifier(valid_buy_models, keep_last_n=ENSEMBLE_SIZE)
+    else:
+        final_buy_model = prev_buy_model if prev_buy_model else buy_mdl
+        print("  [WARN] Solo 1 modello BUY valido, no ensemble")
+
+    if short_enabled and len(valid_short_models) >= 2:
+        final_short_model = EnsembleClassifier(valid_short_models, keep_last_n=ENSEMBLE_SIZE)
+    elif short_enabled:
+        final_short_model = prev_short_model if prev_short_model else (short_mdl if short_enabled else None)
+        print("  [WARN] Solo 1 modello SHORT valido, no ensemble")
+    else:
+        final_short_model = None
 
     return final_buy_model, final_short_model, pred_series
 
