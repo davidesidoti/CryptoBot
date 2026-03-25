@@ -223,3 +223,5 @@ best_params_buy.json
 best_params_short.json
 model_buy.joblib
 model_short.joblib
+model_short_scalp.joblib
+model_buy_scalp.joblib
