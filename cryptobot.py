@@ -758,34 +758,51 @@ def walk_forward_train(df, best_params_buy=None, best_params_short=None):
     # === Auto-calibrazione soglie ensemble ===
     # L'ensemble media le probabilita' di piu' modelli, comprimendo il range.
     # Soglie calibrate per singolo modello (58%/60%) non funzionano per l'ensemble.
-    # Calcoliamo le soglie che producono lo stesso numero di segnali del backtest per-fold.
-    X_oos = X.loc[all_idx]  # tutti i dati out-of-sample
-    n_buy_signals_pf = int(n_open_long)   # segnali dal backtest per-fold
+    # Usiamo SOLO i dati OOS degli ultimi ENSEMBLE_SIZE fold per evitare look-ahead bias:
+    # l'ensemble contiene gli ultimi 5 modelli, calibrare su fold precedenti gonfia le probabilita'.
+    n_recent_oos = ENSEMBLE_SIZE * WF_TEST_BARS
+    recent_idx = all_idx[-n_recent_oos:] if len(all_idx) > n_recent_oos else all_idx
+    X_oos = X.loc[recent_idx]
+
+    # Conta segnali per-fold solo nella finestra recente (stessa finestra dell'ensemble)
+    recent_buy_preds = np.array(all_buy_preds[-n_recent_oos:]) if len(all_buy_preds) > n_recent_oos else np.array(all_buy_preds)
+    recent_buy_proba_arr = np.array(all_buy_proba[-n_recent_oos:]) if len(all_buy_proba) > n_recent_oos else np.array(all_buy_proba)
+    n_buy_signals_pf = int(((recent_buy_preds == 1) & (recent_buy_proba_arr >= MIN_PROBA)).sum())
 
     ens_buy_proba = final_buy_model.predict_proba(X_oos)[:, 1]
-    # Ordina le probabilita' in ordine decrescente e prendi la soglia che produce n_buy_signals_pf segnali
     sorted_buy = np.sort(ens_buy_proba)[::-1]
     if n_buy_signals_pf > 0 and n_buy_signals_pf < len(sorted_buy):
         cal_buy_thresh = float(sorted_buy[n_buy_signals_pf - 1])
-        # Clamp: non scendere sotto 0.30 e non superare MIN_PROBA originale
-        cal_buy_thresh = max(0.30, min(cal_buy_thresh, MIN_PROBA))
+        # Solo floor: non clampiamo in alto, la calibrazione deve compensare la compressione
+        cal_buy_thresh = max(0.30, cal_buy_thresh)
     else:
         cal_buy_thresh = MIN_PROBA
-    print(f"\n  [CALIBRAZIONE] BUY: {n_buy_signals_pf} segnali per-fold -> "
-          f"soglia ensemble = {cal_buy_thresh:.2%} (era {MIN_PROBA:.0%})")
+
+    p10, p25, p50, p75, p90 = np.percentile(ens_buy_proba, [10, 25, 50, 75, 90])
+    print(f"\n  [CALIBRAZIONE] BUY ensemble proba: "
+          f"P10={p10:.2%} P25={p25:.2%} P50={p50:.2%} P75={p75:.2%} P90={p90:.2%}")
+    print(f"  [CALIBRAZIONE] BUY: {n_buy_signals_pf} segnali per-fold (ultimi {ENSEMBLE_SIZE} fold) -> "
+          f"soglia ensemble = {cal_buy_thresh:.2%} (default {MIN_PROBA:.0%})")
 
     cal_short_thresh = SHORT_MIN_PROBA
     if short_enabled and final_short_model is not None:
-        n_short_signals_pf = int(n_open_short)
+        recent_short_preds = np.array(all_short_preds[-n_recent_oos:]) if len(all_short_preds) > n_recent_oos else np.array(all_short_preds)
+        recent_short_proba_arr = np.array(all_short_proba[-n_recent_oos:]) if len(all_short_proba) > n_recent_oos else np.array(all_short_proba)
+        n_short_signals_pf = int(((recent_short_preds == 1) & (recent_short_proba_arr >= SHORT_MIN_PROBA)).sum())
+
         ens_short_proba = final_short_model.predict_proba(X_oos)[:, 1]
         sorted_short = np.sort(ens_short_proba)[::-1]
         if n_short_signals_pf > 0 and n_short_signals_pf < len(sorted_short):
             cal_short_thresh = float(sorted_short[n_short_signals_pf - 1])
-            cal_short_thresh = max(0.30, min(cal_short_thresh, SHORT_MIN_PROBA))
+            cal_short_thresh = max(0.30, cal_short_thresh)
         else:
             cal_short_thresh = SHORT_MIN_PROBA
-        print(f"  [CALIBRAZIONE] SHORT: {n_short_signals_pf} segnali per-fold -> "
-              f"soglia ensemble = {cal_short_thresh:.2%} (era {SHORT_MIN_PROBA:.0%})")
+
+        p10s, p25s, p50s, p75s, p90s = np.percentile(ens_short_proba, [10, 25, 50, 75, 90])
+        print(f"  [CALIBRAZIONE] SHORT ensemble proba: "
+              f"P10={p10s:.2%} P25={p25s:.2%} P50={p50s:.2%} P75={p75s:.2%} P90={p90s:.2%}")
+        print(f"  [CALIBRAZIONE] SHORT: {n_short_signals_pf} segnali per-fold (ultimi {ENSEMBLE_SIZE} fold) -> "
+              f"soglia ensemble = {cal_short_thresh:.2%} (default {SHORT_MIN_PROBA:.0%})")
 
     # Salva soglie calibrate nel modello ensemble per uso in run_bot
     if hasattr(final_buy_model, 'models'):
@@ -1355,6 +1372,10 @@ def run_bot(model_buy, model_short=None):
     eff_buy_thresh = getattr(model_buy, 'calibrated_threshold', MIN_PROBA)
     eff_short_thresh = getattr(model_short, 'calibrated_threshold', SHORT_MIN_PROBA) if model_short else SHORT_MIN_PROBA
     print(f"Soglie effettive: BUY >= {eff_buy_thresh:.2%} | SHORT >= {eff_short_thresh:.2%}")
+    if eff_buy_thresh < MIN_PROBA:
+        print(f"  [INFO] Soglia BUY calibrata ({eff_buy_thresh:.2%}) sotto default ({MIN_PROBA:.0%}) - compressione ensemble compensata")
+    if eff_short_thresh < SHORT_MIN_PROBA:
+        print(f"  [INFO] Soglia SHORT calibrata ({eff_short_thresh:.2%}) sotto default ({SHORT_MIN_PROBA:.0%}) - compressione ensemble compensata")
 
     send_telegram(
         f"🤖 <b>Bot SCALPING avviato ({mode_str})</b>\n"
@@ -1416,6 +1437,10 @@ def run_bot(model_buy, model_short=None):
                 if short_enabled and model_short is not None:
                     cached_short_proba = model_short.predict_proba(last_row)[0][1]
                     cached_short_signal = cached_short_proba >= eff_short_thresh
+
+                # Diagnostica distanza dalla soglia
+                print(f"  [LIVE-DIAG] BUY={cached_buy_proba:.2%} (soglia {eff_buy_thresh:.2%}, gap {cached_buy_proba - eff_buy_thresh:+.2%}) | "
+                      f"SHORT={cached_short_proba:.2%} (soglia {eff_short_thresh:.2%}, gap {cached_short_proba - eff_short_thresh:+.2%})")
 
                 # Segnali tecnici di chiusura
                 cached_sell_signal = technical_sell_signal(cached_df_feat).iloc[-1]
