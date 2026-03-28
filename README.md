@@ -2,7 +2,7 @@
 
 Bot di scalping crypto basato su Machine Learning che opera su **Binance Futures Demo** (soldi finti, dati di mercato reali).
 
-Dual-model **LONG + SHORT** su **candele 5m**: scarica OHLCV, genera 28 feature tecniche ottimizzate per scalping (5m + 15m + 1h multi-timeframe), ottimizza iperparametri con Optuna, allena due classificatori XGBoost con walk-forward validation (~20 fold), backtesta la strategia, e gira in loop live piazzando ordini LONG e SHORT su **Futures Demo** (fee 0.02% maker — critico per scalping). Include dashboard web con signal log dettagliato.
+Dual-model **LONG + SHORT** su **candele 5m**: scarica OHLCV, genera 28 feature tecniche ottimizzate per scalping (5m + 15m + 1h multi-timeframe), ottimizza iperparametri con Optuna, allena due **EnsembleClassifier** XGBoost con walk-forward validation (~20 fold), calibra automaticamente le soglie dell'ensemble, backtesta la strategia, e gira in loop live piazzando ordini LONG e SHORT su **Futures Demo** (fee 0.02% maker — critico per scalping). Include dashboard web con signal log dettagliato.
 
 > **Branch `scalping`** — versione scalping del bot. Il branch `main` contiene la versione swing trading su candele 1h.
 
@@ -15,15 +15,15 @@ build_features() - 28 feature scalping (5m + 15m + 1h multi-timeframe)
         |
 optimize_hyperparams() - 2x Optuna bayesian search (60 trial ciascuno, cache 48h)
         |
-walk_forward_train() - dual XGBoost (BUY + SHORT), ~20 fold scorrevoli
+walk_forward_train() - dual XGBoost (BUY + SHORT), ~20 fold scorrevoli → EnsembleClassifier (ultimi 5 fold) + auto-calibrazione soglie
         |
 backtest() - backtesting.py LONG+SHORT - TP 0.6%, SL 0.4%, trail ATR×1.5
         |
 run_bot() - loop live: LONG + SHORT su Futures Demo, ciclo 60s (segnali ogni 5m)
 ```
 
-**Segnali BUY** generati dal modello ML (XGBoost) con filtro di confidenza (>58%) + trend 1h UP.
-**Segnali SHORT** generati dal secondo modello ML con filtro di confidenza (>60%) + trend 1h DOWN + ADX 1h > 15.
+**Segnali BUY** generati dall'ensemble ML con soglia di confidenza auto-calibrata (default 58%, abbassata per compensare la compressione di probabilità dell'ensemble) + trend 1h UP.
+**Segnali SHORT** generati dal secondo ensemble ML con soglia auto-calibrata (default 60%) + trend 1h DOWN + ADX 1h > 15.
 **Chiusura**: Take profit 0.6%, trailing stop ATR×1.5 (attiva dopo +0.3%), stop loss 0.4%, oppure segnali tecnici (RSI/MACD/EMA).
 **Hold minimo**: 10 minuti (2 barre da 5m) per evitare uscite premature.
 **Futures-only**: entrambe le direzioni passano per Binance Futures Demo (fee 0.02% vs 0.1% spot).
@@ -110,8 +110,8 @@ python dashboard.py
 | `TIMEFRAME` | `5m` | Timeframe candele (scalping) |
 | `FETCH_LIMIT` | `10000` | Candele storiche (~34 giorni a 5m) |
 | `FUTURE_BARS` | `3` | Candele lookahead per il label (15 min) |
-| `MIN_PROBA` | `0.58` | Confidenza minima BUY |
-| `SHORT_MIN_PROBA` | `0.60` | Confidenza minima SHORT |
+| `MIN_PROBA` | `0.58` | Confidenza minima BUY (soglia default — l'ensemble la calibra automaticamente al ribasso) |
+| `SHORT_MIN_PROBA` | `0.60` | Confidenza minima SHORT (idem — calibrata per l'ensemble) |
 | `TRADE_SIZE` | `0.80` | % del capitale per trade |
 | `TAKE_PROFIT` | `0.006` | Take profit 0.6% |
 | `STOP_LOSS` | `0.004` | Stop loss 0.4% |
@@ -176,13 +176,36 @@ CryptoBot/
 ```
 
 File generati a runtime (non committati):
-- `model_buy_scalp.joblib` / `model_short_scalp.joblib` — modelli XGBoost
+- `model_buy_scalp.joblib` / `model_short_scalp.joblib` — EnsembleClassifier XGBoost (con `calibrated_threshold` salvato)
 - `best_params_buy_scalp.json` / `best_params_short_scalp.json` — cache Optuna 48h
 - `bot_state.json` — stato posizione + position_type
-- `dashboard_data.json` — snapshot ciclo + signal_log
+- `dashboard_data.json` — snapshot ciclo + signal_log (include proba effettive e soglie)
 - `trades_log.csv` — log di tutti i trade
 - `price_history.json` — ultime 100 candele per chart
 - `MLStrategy.html` — plot interattivo del backtest
+- `debugging/` — cartella per file di debug dalla VPS (dashboard_data.json, price_history.json, ecc.)
+
+## Diagnostica e debug
+
+### Il bot non fa trade in live?
+
+1. **Controlla le soglie effettive** all'avvio: `Soglie effettive: BUY >= X% | SHORT >= Y%`
+   - Se X = 58% e Y = 60% (default), la calibrazione dell'ensemble non ha funzionato → cancella i `.joblib` per forzare il retrain
+   - Se X < 58%, la calibrazione è attiva e le soglie sono state abbassate per compensare la compressione dell'ensemble
+
+2. **Controlla i `[LIVE-DIAG]`** ad ogni candela 5m:
+   ```
+   [LIVE-DIAG] BUY=35.20% (soglia 38.50%, gap -03.30%) | SHORT=12.10% (soglia 32.00%, gap -19.90%)
+   ```
+   Il `gap` mostra quanto manca alla soglia — se sempre negativo di molto, il modello non sta trovando setup.
+
+3. **Copia i file dalla VPS** nella cartella `debugging/` per analisi offline:
+   - `dashboard_data.json` — contiene `signal_log` con proba e reason per ogni ciclo
+   - `price_history.json` — ultime 100 candele
+
+### Ensemble e compressione probabilità
+
+L'ensemble media 5 modelli fold: le probabilità si comprimono dal range dei modelli individuali (>58%) a ~20-40%. La calibrazione automatica in `walk_forward_train()` trova la soglia corretta per l'ensemble usando solo i dati OOS degli ultimi 5 fold (no look-ahead bias). Le soglie calibrate vengono salvate nell'oggetto ensemble e persistono nel `.joblib`.
 
 ## Disclaimer
 

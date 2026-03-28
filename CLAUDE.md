@@ -99,6 +99,13 @@ run_bot()                → live loop: LONG + SHORT on Futures Demo, every 60s 
 - **Take profit before trailing**: TP check runs before trailing stop in `next()` and `run_bot()`. If both trigger on same bar, TP wins.
 - **Futures-only mode**: `USE_FUTURES_FOR_BOTH=True` routes all orders through Futures. Disabling it falls back to Spot+Futures like the main branch.
 - **15m and 1h features are resampled from 5m**: no separate fetch needed. `build_features()` takes only one df parameter (5m OHLCV).
+- **Ensemble probability compression**: `EnsembleClassifier` averages 5 fold models → probabilities
+  compressed to ~20-40% range even when individual models would hit >58%. The calibration in
+  `walk_forward_train()` compensates by computing a lower threshold for the ensemble (no upper clamp).
+  If live trades = 0, check startup log "Soglie effettive" — if BUY=58%/SHORT=60%, calibration failed.
+  Look at `[LIVE-DIAG]` lines to see actual proba vs threshold gap on each 5m candle.
+- **Calibration uses only last ENSEMBLE_SIZE folds** (not all OOS data) to avoid look-ahead bias.
+  Evaluating the ensemble on early-fold OOS data inflates probabilities (later-trained models see "future").
 
 ## Features used by both models (28 total)
 
@@ -121,6 +128,10 @@ Defined in the `FEATURES` list at the top of `cryptobot.py` — adding a feature
 - **`save_dashboard_data()` signature**: takes `short_proba`, `position_type`, `action_taken`, `reason`
   as optional kwargs. Signal log accumulates last 50 entries in `dashboard_data.json["signal_log"]`.
 - **Commission impact for scalping**: Futures 0.04% round-trip on a 0.5% target = ~8% of profit. Spot 0.2% round-trip = ~40% of profit. Always use Futures for scalping.
+- **Live vs backtest trade drought diagnosis**: put `dashboard_data.json` and `price_history.json` from
+  VPS into `debugging/` folder. Check `signal_log[n]["reason"]` — shows effective threshold and proba.
+  If "Confidenza bassa (BUY X% < 58%)" consistently, calibration failed or model not retrained yet.
+  Delete `.joblib` files to force retrain with new calibration.
 
 ## Quick validation
 
