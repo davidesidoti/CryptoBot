@@ -767,7 +767,7 @@ def walk_forward_train(df, best_params_buy=None, best_params_short=None):
         print("  [WARN] Solo 1 modello BUY valido, no ensemble")
 
     if short_enabled and len(valid_short_models) >= 2:
-        final_short_model = EnsembleClassifier(valid_short_models, keep_last_n=ENSEMBLE_SIZE)
+        final_short_model = EnsembleClassifier(valid_short_models, keep_last_n=ENSEMBLE_SIZE, agree_thresh=0.40)
     elif short_enabled:
         final_short_model = prev_short_model if prev_short_model else (short_mdl if short_enabled else None)
         print("  [WARN] Solo 1 modello SHORT valido, no ensemble")
@@ -790,14 +790,15 @@ def walk_forward_train(df, best_params_buy=None, best_params_short=None):
 
     ens_buy_proba = final_buy_model.predict_proba(X_oos)[:, 1]
     sorted_buy = np.sort(ens_buy_proba)[::-1]
+    p10, p25, p50, p75, p90 = np.percentile(ens_buy_proba, [10, 25, 50, 75, 90])
     if n_buy_signals_pf > 0 and n_buy_signals_pf < len(sorted_buy):
         cal_buy_thresh = float(sorted_buy[n_buy_signals_pf - 1])
-        # Solo floor: non clampiamo in alto, la calibrazione deve compensare la compressione
         cal_buy_thresh = max(0.30, cal_buy_thresh)
+        # Cap: la soglia non puo' superare P90 della distribuzione ensemble
+        cal_buy_thresh = min(cal_buy_thresh, max(MIN_PROBA, p90))
     else:
         cal_buy_thresh = MIN_PROBA
 
-    p10, p25, p50, p75, p90 = np.percentile(ens_buy_proba, [10, 25, 50, 75, 90])
     print(f"\n  [CALIBRAZIONE] BUY ensemble proba: "
           f"P10={p10:.2%} P25={p25:.2%} P50={p50:.2%} P75={p75:.2%} P90={p90:.2%}")
     print(f"  [CALIBRAZIONE] BUY: {n_buy_signals_pf} segnali per-fold (ultimi {ENSEMBLE_SIZE} fold) -> "
@@ -811,13 +812,14 @@ def walk_forward_train(df, best_params_buy=None, best_params_short=None):
 
         ens_short_proba = final_short_model.predict_proba(X_oos)[:, 1]
         sorted_short = np.sort(ens_short_proba)[::-1]
+        p10s, p25s, p50s, p75s, p90s = np.percentile(ens_short_proba, [10, 25, 50, 75, 90])
         if n_short_signals_pf > 0 and n_short_signals_pf < len(sorted_short):
             cal_short_thresh = float(sorted_short[n_short_signals_pf - 1])
             cal_short_thresh = max(0.30, cal_short_thresh)
+            # Cap: la soglia non puo' superare P90 della distribuzione ensemble
+            cal_short_thresh = min(cal_short_thresh, max(SHORT_MIN_PROBA, p90s))
         else:
             cal_short_thresh = SHORT_MIN_PROBA
-
-        p10s, p25s, p50s, p75s, p90s = np.percentile(ens_short_proba, [10, 25, 50, 75, 90])
         print(f"  [CALIBRAZIONE] SHORT ensemble proba: "
               f"P10={p10s:.2%} P25={p25s:.2%} P50={p50s:.2%} P75={p75s:.2%} P90={p90s:.2%}")
         print(f"  [CALIBRAZIONE] SHORT: {n_short_signals_pf} segnali per-fold (ultimi {ENSEMBLE_SIZE} fold) -> "
