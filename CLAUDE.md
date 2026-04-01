@@ -89,7 +89,8 @@ run_bot()                → live loop: LONG + SHORT on Futures Demo, every 60s 
 - **Dashboard**: `dashboard.py` (Flask on port 5050) reads `dashboard_data.json` and `price_history.json`.
   Includes signal log with action/reason for each cycle. Endpoints: `/api/status`, `/api/trades`, `/api/equity`, `/api/candles`.
 - **Degenerate folds**: use previous fold's model as fallback instead of zeroing predictions.
-- **`save_state()` position_type + trail_stop**: old state files without `position_type` default to "long" for backward compat. `trail_stop` persists the current trailing stop price across restarts.
+- **`save_state()` / `load_state()`**: returns 9-tuple `(entry_price, qty, entry_time, position_type, trail_stop, consecutive_sl, daily_pnl, daily_reset_date, pause_until)`. All new fields use `.get(key, default)` for backward compat with old state files.
+- **Circuit breaker**: 2 consecutive stop-losses → `pause_until = now + 2h`; `daily_pnl / initial_capital ≤ -1.5%` → `pause_until = midnight UTC`. Win/TP resets `consecutive_sl`. State persists across restarts via `bot_state.json`.
 - **Retry con backoff**: transient network errors retried 3x (5s, 15s, 30s) before Telegram notification. Faster than swing version because scalping needs quick recovery.
 - **State persistence after order**: `save_state()` called immediately after `create_order()`, before Telegram/dashboard.
 - **fetch_ohlcv caching**: exchange instance is cached globally to avoid repeated `load_markets()` calls.
@@ -99,13 +100,15 @@ run_bot()                → live loop: LONG + SHORT on Futures Demo, every 60s 
 - **Take profit before trailing**: TP check runs before trailing stop in `next()` and `run_bot()`. If both trigger on same bar, TP wins.
 - **Futures-only mode**: `USE_FUTURES_FOR_BOTH=True` routes all orders through Futures. Disabling it falls back to Spot+Futures like the main branch.
 - **15m and 1h features are resampled from 5m**: no separate fetch needed. `build_features()` takes only one df parameter (5m OHLCV).
-- **Ensemble probability compression**: `EnsembleClassifier` averages 5 fold models → probabilities
-  compressed to ~20-40% range even when individual models would hit >58%. The calibration in
-  `walk_forward_train()` compensates by computing a lower threshold for the ensemble (no upper clamp).
-  If live trades = 0, check startup log "Soglie effettive" — if BUY=58%/SHORT=60%, calibration failed.
-  Look at `[LIVE-DIAG]` lines to see actual proba vs threshold gap on each 5m candle.
+- **EnsembleClassifier (max-with-agreement)**: instead of mean, returns max of 5 models when ≥3 agree.
+  BUY uses `agree_thresh=0.50`; SHORT uses `agree_thresh=0.40` (SHORT signals are less pronounced individually).
+  Calibration caps threshold at `min(calibrated, max(default, P90_distribution))` — prevents impossible thresholds.
+  If startup log shows "BUY=58%/SHORT=60%" (defaults), it means P90 cap kicked in — normal, not failure.
+  Look at `[LIVE-DIAG]` to see actual proba vs threshold on each 5m candle.
 - **Calibration uses only last ENSEMBLE_SIZE folds** (not all OOS data) to avoid look-ahead bias.
-  Evaluating the ensemble on early-fold OOS data inflates probabilities (later-trained models see "future").
+  Evaluating ensemble on early-fold OOS data inflates probabilities (later-trained models see "future").
+- **Backtest uses per-fold models, not ensemble**: OOS backtest shows more trades than live trading.
+  Comparing backtest trade count vs live is misleading — ensemble threshold is higher than per-fold.
 
 ## Features used by both models (28 total)
 
@@ -125,8 +128,9 @@ Defined in the `FEATURES` list at the top of `cryptobot.py` — adding a feature
   import — not a real jinja2 bug. Check `journalctl -u cryptobot -n 100 --no-pager` for full context.
 - **VPS Python 3.13**: Hostinger VPS runs Python 3.13 which can have compatibility issues with older
   versions of bokeh/jinja2. Keep `pip install --upgrade jinja2 markupsafe bokeh` in deployment steps.
-- **`save_dashboard_data()` signature**: takes `short_proba`, `position_type`, `action_taken`, `reason`
-  as optional kwargs. Signal log accumulates last 50 entries in `dashboard_data.json["signal_log"]`.
+- **`save_dashboard_data()` signature**: takes `short_proba`, `position_type`, `action_taken`, `reason`,
+  `eff_buy_thresh`, `eff_short_thresh` as optional kwargs. Pass calibrated thresholds (not MIN_PROBA constants)
+  so dashboard shows actual effective thresholds. Signal log accumulates last 50 entries.
 - **Commission impact for scalping**: Futures 0.04% round-trip on a 0.5% target = ~8% of profit. Spot 0.2% round-trip = ~40% of profit. Always use Futures for scalping.
 - **Live vs backtest trade drought diagnosis**: put `dashboard_data.json` and `price_history.json` from
   VPS into `debugging/` folder. Check `signal_log[n]["reason"]` — shows effective threshold and proba.
