@@ -49,10 +49,10 @@ run_bot()                → live loop: LONG + SHORT on Futures Demo, every 60s 
 - **SHORT model**: SHORT (-1) vs NO-SHORT (0). `predict_proba >= SHORT_MIN_PROBA (0.60)` to open SHORT.
 
 **Signal logic:**
-- LONG close: take profit (0.6%), trailing stop (ATR×1.5 after +0.3%), stop loss (0.4%), technical rules (RSI>65, MACD cross, EMA20 break)
+- LONG close: take profit (0.6%), trailing stop (ATR×1.5 after +0.3%), stop loss (0.4%), technical rules (RSI>70, MACD cross, EMA20 break)
 - SHORT close: take profit (0.6%), trailing stop, stop loss (0.4%), technical cover rules (RSI<35, MACD bullish, EMA20 break)
-- `MIN_HOLD_BARS = 2` suppresses close for 10 min (2 bars × 5m) for both LONG and SHORT
-- Entry filters: LONG requires `trend_1h == 1`; SHORT requires `trend_1h == 0` AND `adx_1h > 15`
+- `MIN_HOLD_BARS = 3` suppresses close for 15 min (3 bars × 5m) for LONG; `SHORT_MIN_HOLD = 3` (separate constant, line 80) for SHORT
+- Entry filters: LONG requires `trend_1h == 1` AND `trend_15m == 1`; SHORT requires `trend_1h == 0` AND `adx_1h > 15`
 - Conflict: if both BUY and SHORT fire simultaneously → HOLD (do nothing)
 
 **Exit priority order:**
@@ -60,7 +60,7 @@ run_bot()                → live loop: LONG + SHORT on Futures Demo, every 60s 
 2. Trailing stop (ATR×1.5, activated after +0.3%)
 3. Stop loss (0.4%)
 4. Technical close signals
-5. Hold minimum (10 min)
+5. Hold minimum (15 min)
 
 ## Key constraints
 
@@ -89,8 +89,10 @@ run_bot()                → live loop: LONG + SHORT on Futures Demo, every 60s 
 - **Dashboard**: `dashboard.py` (Flask on port 5050) reads `dashboard_data.json` and `price_history.json`.
   Includes signal log with action/reason for each cycle. Endpoints: `/api/status`, `/api/trades`, `/api/equity`, `/api/candles`.
 - **Degenerate folds**: use previous fold's model as fallback instead of zeroing predictions.
-- **`save_state()` / `load_state()`**: returns 9-tuple `(entry_price, qty, entry_time, position_type, trail_stop, consecutive_sl, daily_pnl, daily_reset_date, pause_until)`. All new fields use `.get(key, default)` for backward compat with old state files.
+- **`save_state()` / `load_state()`**: returns 10-tuple `(entry_price, qty, entry_time, position_type, trail_stop, consecutive_sl, daily_pnl, daily_reset_date, pause_until, cooldown_until)`. All new fields use `.get(key, default)` for backward compat with old state files.
 - **Circuit breaker**: 2 consecutive stop-losses → `pause_until = now + 2h`; `daily_pnl / initial_capital ≤ -1.5%` → `pause_until = midnight UTC`. Win/TP resets `consecutive_sl`. State persists across restarts via `bot_state.json`.
+- **Cooldown post-uscita**: after SELL_TECH/COVER_TECH → `cooldown_until = now + 30min` (loss) or `+5min` (win); after TP/trailing → `+5min`; after SL → no cooldown (CB handles it). Blocks new entries only, never exits. Persists via `bot_state.json`.
+- **`SHORT_MIN_HOLD` is separate from `MIN_HOLD_BARS`** (line 80) — both must be updated when changing minimum hold for both directions.
 - **Retry con backoff**: transient network errors retried 3x (5s, 15s, 30s) before Telegram notification. Faster than swing version because scalping needs quick recovery.
 - **State persistence after order**: `save_state()` called immediately after `create_order()`, before Telegram/dashboard.
 - **fetch_ohlcv caching**: exchange instance is cached globally to avoid repeated `load_markets()` calls.
