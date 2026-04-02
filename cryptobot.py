@@ -65,7 +65,7 @@ INITIAL_CASH    = 500         # capitale iniziale per il backtest (in USD)
 SLEEP_SECONDS   = 60          # secondi tra ogni ciclo del bot (1 min, segnali ML ogni 5m)
 MAX_RETRIES     = 3           # tentativi per errori di rete transitori
 RETRY_BACKOFF   = [5, 15, 30] # secondi di attesa tra retry (piu' veloci per scalping)
-MIN_HOLD_BARS   = 2           # hold minimo 2 barre = 10 min
+MIN_HOLD_BARS   = 3           # hold minimo 3 barre = 15 min
 LOG_FILE        = "trades_log.csv"
 RETRAIN_HOURS   = 12          # riaddestra il modello ogni 12 ore (piu' frequente per 5m)
 MODEL_FILE      = "model.joblib"
@@ -77,7 +77,7 @@ PRICE_HISTORY_FILE = "price_history.json"
 SHORT_STOP_LOSS    = 0.004   # 0.4% stop loss per SHORT (scalping)
 SHORT_MIN_PROBA    = 0.60    # soglia SHORT
 SHORT_TRADE_SIZE   = 0.80    # 80% capitale
-SHORT_MIN_HOLD     = 2       # hold minimo 2 barre = 10 min
+SHORT_MIN_HOLD     = 3       # hold minimo 3 barre = 15 min
 ENABLE_SHORT       = True    # flag per abilitare/disabilitare SHORT
 SHORT_ADX_MIN      = 15      # ADX minimo per SHORT (naturalmente piu' basso su 5m)
 
@@ -443,14 +443,14 @@ def optimize_hyperparams(df, target_label=1, cache_file=None, n_trials=OPTUNA_TR
 def technical_sell_signal(df):
     """
     Genera segnali SELL basati su regole tecniche (scalping):
-    - RSI fast > 65 (ipercomprato) + slope negativo
+    - RSI fast > 70 (ipercomprato) + slope negativo
     - MACD cross ribassista (singola barra)
     - Prezzo crolla sotto EMA20 con momentum -0.3%
     """
     sell = pd.Series(False, index=df.index)
 
     # RSI ipercomprato + inizio discesa
-    sell |= (df["rsi_fast"] > 65) & (df["rsi_slope"] < -2)
+    sell |= (df["rsi_fast"] > 70) & (df["rsi_slope"] < -2)
 
     # MACD cross ribassista (singola barra, reattivo per scalping)
     macd_gap = df["macd_fast"] - df["macd_signal_fast"]
@@ -1152,8 +1152,9 @@ def send_telegram(message):
 # ─────────────────────────────────────────────
 
 def save_state(entry_price, entry_qty, entry_time=None, position_type=None, trail_stop=None,
-               consecutive_sl=0, daily_pnl=0.0, daily_reset_date=None, pause_until=None):
-    """Salva lo stato della posizione e circuit breaker su file JSON."""
+               consecutive_sl=0, daily_pnl=0.0, daily_reset_date=None, pause_until=None,
+               cooldown_until=None):
+    """Salva lo stato della posizione, circuit breaker e cooldown su file JSON."""
     with open(STATE_FILE, "w") as f:
         json.dump({
             "entry_price": entry_price,
@@ -1166,14 +1167,16 @@ def save_state(entry_price, entry_qty, entry_time=None, position_type=None, trai
             "daily_pnl": daily_pnl,
             "daily_reset_date": daily_reset_date,
             "pause_until": pause_until,
+            # Cooldown post-uscita tecnica
+            "cooldown_until": cooldown_until,
         }, f)
 
 
 def load_state():
     """
-    Carica lo stato della posizione e circuit breaker da file JSON.
+    Carica lo stato della posizione, circuit breaker e cooldown da file JSON.
     Ritorna (entry_price, entry_qty, entry_time, position_type, trail_stop,
-             consecutive_sl, daily_pnl, daily_reset_date, pause_until).
+             consecutive_sl, daily_pnl, daily_reset_date, pause_until, cooldown_until).
     Backward compat: vecchi file senza i nuovi campi usano valori di default.
     """
     if os.path.isfile(STATE_FILE):
@@ -1190,10 +1193,11 @@ def load_state():
             ts = s.get("trail_stop")
             return (ep, s.get("entry_qty"), entry_time, pt, ts,
                     s.get("consecutive_sl", 0), s.get("daily_pnl", 0.0),
-                    s.get("daily_reset_date"), s.get("pause_until"))
+                    s.get("daily_reset_date"), s.get("pause_until"),
+                    s.get("cooldown_until"))
         except (json.JSONDecodeError, KeyError, ValueError):
             pass
-    return None, None, None, None, None, 0, 0.0, None, None
+    return None, None, None, None, None, 0, 0.0, None, None, None
 
 
 def save_dashboard_data(price, buy_proba, signal_str, usdt, btc,
@@ -1380,7 +1384,7 @@ def run_bot(model_buy, model_short=None):
     - Futures-only: LONG e SHORT entrambi su Binance Futures Demo (fee 0.02%)
     - Ciclo ogni 60s: check stop/TP/trailing ogni minuto, segnali ML ogni 5m
     - Take profit 0.6%, stop loss 0.4%, trailing ATR×1.5
-    - Hold minimo 10 min (2 barre da 5m)
+    - Hold minimo 15 min (3 barre da 5m)
     """
     # === Exchange setup (Futures-only per scalping) ===
     exchange_futures = get_testnet_exchange("future")
@@ -1391,12 +1395,14 @@ def run_bot(model_buy, model_short=None):
 
     # Carica stato precedente (sopravvive a restart)
     (entry_price, entry_qty, entry_time, position_type, trail_stop,
-     consecutive_sl, daily_pnl, daily_reset_date, pause_until) = load_state()
+     consecutive_sl, daily_pnl, daily_reset_date, pause_until, cooldown_until) = load_state()
     if entry_price:
         print(f"Stato caricato: {position_type.upper()} @ {entry_price:.2f} "
               f"({entry_qty} BTC, trail_stop: {trail_stop})")
     if consecutive_sl > 0 or pause_until:
         print(f"  [CB] SL consecutivi: {consecutive_sl} | daily P&L: ${daily_pnl:.2f} | pausa: {pause_until}")
+    if cooldown_until:
+        print(f"  [COOLDOWN] Cooldown post-uscita attivo fino: {cooldown_until}")
 
     last_retrain = time.time()
     last_status  = time.time()
@@ -1601,8 +1607,9 @@ def run_bot(model_buy, model_short=None):
                     entry_price = None; entry_qty = None; entry_time = None; position_type = None; trail_stop = None
                     consecutive_sl = 0
                     daily_pnl += pnl_usd
+                    cooldown_until = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
                     save_state(entry_price, entry_qty, entry_time, position_type, trail_stop,
-                               consecutive_sl, daily_pnl, daily_reset_date, pause_until)
+                               consecutive_sl, daily_pnl, daily_reset_date, pause_until, cooldown_until)
                     print(f"  -> TAKE PROFIT LONG: SELL {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
                     log_trade("SELL(TP)", qty, price, "TAKE_PROFIT", buy_proba, pnl_usd)
                     send_telegram(
@@ -1636,8 +1643,9 @@ def run_bot(model_buy, model_short=None):
                     entry_price = None; entry_qty = None; entry_time = None; position_type = None; trail_stop = None
                     consecutive_sl = 0
                     daily_pnl += pnl_usd
+                    cooldown_until = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
                     save_state(entry_price, entry_qty, entry_time, position_type, trail_stop,
-                               consecutive_sl, daily_pnl, daily_reset_date, pause_until)
+                               consecutive_sl, daily_pnl, daily_reset_date, pause_until, cooldown_until)
                     print(f"  -> TAKE PROFIT SHORT: BUY {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
                     log_trade("BUY(TP)", qty, price, "TAKE_PROFIT", short_proba, pnl_usd)
                     send_telegram(
@@ -1671,7 +1679,7 @@ def run_bot(model_buy, model_short=None):
                     else:
                         trail_stop = max(trail_stop, new_trail)
                     save_state(entry_price, entry_qty, entry_time, position_type, trail_stop,
-                               consecutive_sl, daily_pnl, daily_reset_date, pause_until)
+                               consecutive_sl, daily_pnl, daily_reset_date, pause_until, cooldown_until)
                     if price <= trail_stop:
                         stop_triggered = True
                         dash_action = "TRAIL_STOP_LONG"
@@ -1709,8 +1717,9 @@ def run_bot(model_buy, model_short=None):
                     else:  # trailing stop (trade prima era in profitto)
                         if pnl_usd > 0:
                             consecutive_sl = 0
+                        cooldown_until = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
                     save_state(entry_price, entry_qty, entry_time, position_type, trail_stop,
-                               consecutive_sl, daily_pnl, daily_reset_date, pause_until)
+                               consecutive_sl, daily_pnl, daily_reset_date, pause_until, cooldown_until)
                     print(f"  -> {dash_action}: SELL {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
                     log_trade("SELL(TS)" if "TRAIL" in dash_action else "SELL(SL)", qty, price, dash_action, buy_proba, pnl_usd)
                     send_telegram(
@@ -1740,7 +1749,7 @@ def run_bot(model_buy, model_short=None):
                     else:
                         trail_stop = min(trail_stop, new_trail)
                     save_state(entry_price, entry_qty, entry_time, position_type, trail_stop,
-                               consecutive_sl, daily_pnl, daily_reset_date, pause_until)
+                               consecutive_sl, daily_pnl, daily_reset_date, pause_until, cooldown_until)
                     if price >= trail_stop:
                         stop_triggered = True
                         dash_action = "TRAIL_STOP_SHORT"
@@ -1778,8 +1787,9 @@ def run_bot(model_buy, model_short=None):
                     else:  # trailing stop (trade prima era in profitto)
                         if pnl_usd > 0:
                             consecutive_sl = 0
+                        cooldown_until = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
                     save_state(entry_price, entry_qty, entry_time, position_type, trail_stop,
-                               consecutive_sl, daily_pnl, daily_reset_date, pause_until)
+                               consecutive_sl, daily_pnl, daily_reset_date, pause_until, cooldown_until)
                     print(f"  -> {dash_action}: BUY {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
                     log_trade("BUY(TS)" if "TRAIL" in dash_action else "BUY(SL)", qty, price, dash_action, short_proba, pnl_usd)
                     send_telegram(
@@ -1836,15 +1846,25 @@ def run_bot(model_buy, model_short=None):
                 except (ValueError, TypeError):
                     pause_until = None
 
-            # Leggi filtro trend 1h e ADX 1h
+            # Cooldown post-uscita tecnica: risolvi timestamp scaduti
+            if cooldown_until:
+                try:
+                    cd_dt = datetime.fromisoformat(cooldown_until)
+                    if datetime.now(timezone.utc) >= cd_dt:
+                        cooldown_until = None
+                except (ValueError, TypeError):
+                    cooldown_until = None
+
+            # Leggi filtro trend 1h, 15m e ADX 1h
             trend_1h_val = df_feat["trend_1h"].iloc[-1] if "trend_1h" in df_feat.columns else 0
+            trend_15m_val = df_feat["trend_15m"].iloc[-1] if "trend_15m" in df_feat.columns else 0
             adx_1h_val = df_feat["adx_1h"].iloc[-1] if "adx_1h" in df_feat.columns else 0
 
-            if is_5m_close and buy_signal and usdt > 10 and not position_type and not cb_paused:
-                if trend_1h_val != 1:
+            if is_5m_close and buy_signal and usdt > 10 and not position_type and not cb_paused and not cooldown_until:
+                if trend_1h_val != 1 or trend_15m_val != 1:
                     dash_action = "BUY_BLOCKED"
-                    dash_reason = f"Trend 1h DOWN, BUY {buy_proba:.0%} bloccato"
-                    print(f"  -> Trend 1h ribassista, BUY bloccato.")
+                    dash_reason = f"Trend 1h/15m non UP (1h={trend_1h_val:.0f}, 15m={trend_15m_val:.0f}), BUY {buy_proba:.0%} bloccato"
+                    print(f"  -> Trend 1h/15m ribassista, BUY bloccato.")
                 else:
                     qty = round((usdt * TRADE_SIZE) / price, 6)
                     try:
@@ -1858,7 +1878,7 @@ def run_bot(model_buy, model_short=None):
                     entry_price = price; entry_qty = qty; trail_stop = None
                     entry_time = datetime.now(timezone.utc); position_type = "long"
                     save_state(entry_price, entry_qty, entry_time, position_type, trail_stop,
-                               consecutive_sl, daily_pnl, daily_reset_date, pause_until)
+                               consecutive_sl, daily_pnl, daily_reset_date, pause_until, cooldown_until)
                     print(f"  -> ORDER: BUY {qty} BTC @ {price:.2f} (prob: {buy_proba:.0%})")
                     log_trade("BUY", qty, price, "BUY", buy_proba)
                     send_telegram(
@@ -1870,7 +1890,7 @@ def run_bot(model_buy, model_short=None):
                         f"🎯 TP: {TAKE_PROFIT:.1%} | SL: {STOP_LOSS:.1%}"
                     )
 
-            elif is_5m_close and short_signal and short_enabled and usdt > 10 and not position_type and not cb_paused:
+            elif is_5m_close and short_signal and short_enabled and usdt > 10 and not position_type and not cb_paused and not cooldown_until:
                 if trend_1h_val != 0:
                     dash_action = "SHORT_BLOCKED"
                     dash_reason = f"Trend 1h UP, SHORT {short_proba:.0%} bloccato"
@@ -1892,7 +1912,7 @@ def run_bot(model_buy, model_short=None):
                     entry_price = price; entry_qty = qty; trail_stop = None
                     entry_time = datetime.now(timezone.utc); position_type = "short"
                     save_state(entry_price, entry_qty, entry_time, position_type, trail_stop,
-                               consecutive_sl, daily_pnl, daily_reset_date, pause_until)
+                               consecutive_sl, daily_pnl, daily_reset_date, pause_until, cooldown_until)
                     print(f"  -> ORDER: SHORT {qty} BTC @ {price:.2f} (prob: {short_proba:.0%}, ADX 1h: {adx_1h_val:.0f})")
                     log_trade("SHORT", qty, price, "SHORT", short_proba)
                     send_telegram(
@@ -1923,9 +1943,11 @@ def run_bot(model_buy, model_short=None):
                 daily_pnl += pnl_usd
                 if pnl_usd > 0:
                     consecutive_sl = 0
+                cooldown_mins = 5 if pnl_usd >= 0 else 30
+                cooldown_until = (datetime.now(timezone.utc) + timedelta(minutes=cooldown_mins)).isoformat()
                 save_state(entry_price, entry_qty, entry_time, position_type, trail_stop,
-                           consecutive_sl, daily_pnl, daily_reset_date, pause_until)
-                print(f"  -> ORDER: CLOSE LONG {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
+                           consecutive_sl, daily_pnl, daily_reset_date, pause_until, cooldown_until)
+                print(f"  -> ORDER: CLOSE LONG {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f}) | cooldown {cooldown_mins}m")
                 log_trade("SELL", qty, price, "SELL_TECH", buy_proba, pnl_usd)
                 pnl_icon = "📈" if pnl_usd >= 0 else "📉"
                 send_telegram(
@@ -1950,9 +1972,11 @@ def run_bot(model_buy, model_short=None):
                 daily_pnl += pnl_usd
                 if pnl_usd > 0:
                     consecutive_sl = 0
+                cooldown_mins = 5 if pnl_usd >= 0 else 30
+                cooldown_until = (datetime.now(timezone.utc) + timedelta(minutes=cooldown_mins)).isoformat()
                 save_state(entry_price, entry_qty, entry_time, position_type, trail_stop,
-                           consecutive_sl, daily_pnl, daily_reset_date, pause_until)
-                print(f"  -> ORDER: CLOSE SHORT {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f})")
+                           consecutive_sl, daily_pnl, daily_reset_date, pause_until, cooldown_until)
+                print(f"  -> ORDER: CLOSE SHORT {qty} BTC @ {price:.2f} (P&L: ${pnl_usd:+,.2f}) | cooldown {cooldown_mins}m")
                 log_trade("COVER", qty, price, "COVER_TECH", short_proba, pnl_usd)
                 pnl_icon = "📈" if pnl_usd >= 0 else "📉"
                 send_telegram(
