@@ -60,7 +60,7 @@ def equity():
             rows.append(row)
 
     # Costruisci equity curve da tutti i trade chiusi (SELL, COVER, TP, TS, SL)
-    equity = 500.0  # INITIAL_CASH
+    equity = 5000.0  # INITIAL_CASH
     curve = [{"timestamp": "", "equity": equity}]
     close_sides = ("SELL", "SELL(TP)", "SELL(TS)", "SELL(SL)",
                    "COVER", "BUY(TP)", "BUY(TS)", "BUY(SL)")

@@ -61,7 +61,7 @@ STOP_LOSS       = 0.007       # 0.7% stop loss (scalping — più largo per filt
 TRAIL_ATR_MULT  = 2.0         # trailing stop = ATR * 2.0 (più largo, evita shake-out)
 TRAIL_ACTIVATE  = 0.005       # trailing si attiva dopo +0.5% di profitto
 TAKE_PROFIT     = 0.012       # 1.2% take profit (R:R 1.71:1 con SL 0.7%)
-INITIAL_CASH    = 500         # capitale iniziale per il backtest (in USD)
+INITIAL_CASH    = 5000         # capitale iniziale per il backtest (in USD)
 SLEEP_SECONDS   = 60          # secondi tra ogni ciclo del bot (1 min, segnali ML ogni 5m)
 MAX_RETRIES     = 3           # tentativi per errori di rete transitori
 RETRY_BACKOFF   = [5, 15, 30] # secondi di attesa tra retry (piu' veloci per scalping)
