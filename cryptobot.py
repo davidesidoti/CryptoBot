@@ -53,19 +53,19 @@ SYMBOL          = "BTC/USDT"
 TIMEFRAME       = "5m"        # candele 5 minuti (scalping)
 FETCH_LIMIT     = 15000       # quante candele storiche scaricare (paginato, ~52 giorni a 5m)
 N_TRAIN         = 400         # candele usate per il training
-FUTURE_BARS     = 3           # quante candele in avanti per calcolare il label (15 min)
-SIGNAL_THRESH   = 0.003       # 0.3% di movimento minimo per generare segnale
+FUTURE_BARS     = 5           # quante candele in avanti per calcolare il label (25 min)
+SIGNAL_THRESH   = 0.004       # 0.4% di movimento minimo per generare segnale
 MIN_PROBA       = 0.58        # confidenza minima per BUY
 TRADE_SIZE      = 0.80        # % del capitale usata per ogni trade
-STOP_LOSS       = 0.004       # 0.4% stop loss (scalping)
-TRAIL_ATR_MULT  = 1.5         # trailing stop = ATR * 1.5 (stretto per scalping)
-TRAIL_ACTIVATE  = 0.003       # trailing si attiva dopo +0.3% di profitto
-TAKE_PROFIT     = 0.006       # 0.6% take profit
+STOP_LOSS       = 0.007       # 0.7% stop loss (scalping — più largo per filtrare rumore 5m)
+TRAIL_ATR_MULT  = 2.0         # trailing stop = ATR * 2.0 (più largo, evita shake-out)
+TRAIL_ACTIVATE  = 0.005       # trailing si attiva dopo +0.5% di profitto
+TAKE_PROFIT     = 0.012       # 1.2% take profit (R:R 1.71:1 con SL 0.7%)
 INITIAL_CASH    = 500         # capitale iniziale per il backtest (in USD)
 SLEEP_SECONDS   = 60          # secondi tra ogni ciclo del bot (1 min, segnali ML ogni 5m)
 MAX_RETRIES     = 3           # tentativi per errori di rete transitori
 RETRY_BACKOFF   = [5, 15, 30] # secondi di attesa tra retry (piu' veloci per scalping)
-MIN_HOLD_BARS   = 3           # hold minimo 3 barre = 15 min
+MIN_HOLD_BARS   = 6           # hold minimo 6 barre = 30 min
 LOG_FILE        = "trades_log.csv"
 RETRAIN_HOURS   = 12          # riaddestra il modello ogni 12 ore (piu' frequente per 5m)
 MODEL_FILE      = "model.joblib"
@@ -74,12 +74,12 @@ DASHBOARD_FILE  = "dashboard_data.json"
 PRICE_HISTORY_FILE = "price_history.json"
 
 # SHORT parameters (scalping)
-SHORT_STOP_LOSS    = 0.004   # 0.4% stop loss per SHORT (scalping)
+SHORT_STOP_LOSS    = 0.007   # 0.7% stop loss per SHORT (scalping — più largo per filtrare rumore 5m)
 SHORT_MIN_PROBA    = 0.60    # soglia SHORT
 SHORT_TRADE_SIZE   = 0.80    # 80% capitale
-SHORT_MIN_HOLD     = 3       # hold minimo 3 barre = 15 min
+SHORT_MIN_HOLD     = 5       # hold minimo 5 barre = 25 min
 ENABLE_SHORT       = True    # flag per abilitare/disabilitare SHORT
-SHORT_ADX_MIN      = 15      # ADX minimo per SHORT (naturalmente piu' basso su 5m)
+SHORT_ADX_MIN      = 12      # ADX minimo per SHORT
 
 # Futures-only mode (entrambi LONG e SHORT su Futures per fee 0.02% maker)
 USE_FUTURES_FOR_BOTH = True
@@ -443,21 +443,21 @@ def optimize_hyperparams(df, target_label=1, cache_file=None, n_trials=OPTUNA_TR
 def technical_sell_signal(df):
     """
     Genera segnali SELL basati su regole tecniche (scalping):
-    - RSI fast > 70 (ipercomprato) + slope negativo
-    - MACD cross ribassista (singola barra)
-    - Prezzo crolla sotto EMA20 con momentum -0.3%
+    - RSI fast > 75 (ipercomprato estremo) + slope fortemente negativo
+    - MACD cross ribassista confermato su 2 barre consecutive
+    - Prezzo crolla sotto EMA20 con momentum forte (-0.5%)
     """
     sell = pd.Series(False, index=df.index)
 
-    # RSI ipercomprato + inizio discesa
-    sell |= (df["rsi_fast"] > 70) & (df["rsi_slope"] < -2)
+    # RSI ipercomprato estremo + reversal forte
+    sell |= (df["rsi_fast"] > 75) & (df["rsi_slope"] < -4)
 
-    # MACD cross ribassista (singola barra, reattivo per scalping)
+    # MACD cross ribassista confermato (2 barre consecutive negative e in peggioramento)
     macd_gap = df["macd_fast"] - df["macd_signal_fast"]
-    sell |= (macd_gap < 0) & (macd_gap.diff() < 0)
+    sell |= (macd_gap < 0) & (macd_gap.diff() < 0) & (macd_gap.shift(1) < 0)
 
-    # Prezzo crolla sotto EMA20 con momentum (-0.3%)
-    sell |= (df["trend_up"] == 0) & (df["price_change"] < -0.003)
+    # Prezzo crolla sotto EMA20 con momentum forte (-0.5%)
+    sell |= (df["trend_up"] == 0) & (df["price_change"] < -0.005)
 
     return sell
 
@@ -465,21 +465,21 @@ def technical_sell_signal(df):
 def technical_cover_signal(df):
     """
     Genera segnali di COPERTURA SHORT basati su regole tecniche (scalping):
-    - RSI fast < 35 (ipervenduto) + rimbalzo
-    - MACD cross rialzista (singola barra)
-    - Prezzo risale sopra EMA20 con momentum +0.3%
+    - RSI fast < 28 (ipervenduto estremo) + rimbalzo forte
+    - MACD cross rialzista confermato su 2 barre consecutive
+    - Prezzo risale sopra EMA20 con momentum forte (+0.5%)
     """
     cover = pd.Series(False, index=df.index)
 
-    # RSI ipervenduto + inizio rimbalzo
-    cover |= (df["rsi_fast"] < 35) & (df["rsi_slope"] > 2)
+    # RSI ipervenduto estremo + rimbalzo forte
+    cover |= (df["rsi_fast"] < 28) & (df["rsi_slope"] > 4)
 
-    # MACD cross rialzista (singola barra, reattivo per scalping)
+    # MACD cross rialzista confermato (2 barre consecutive positive e in miglioramento)
     macd_gap = df["macd_fast"] - df["macd_signal_fast"]
-    cover |= (macd_gap > 0) & (macd_gap.diff() > 0)
+    cover |= (macd_gap > 0) & (macd_gap.diff() > 0) & (macd_gap.shift(1) > 0)
 
-    # Prezzo risale sopra EMA20 con momentum (+0.3%)
-    cover |= (df["trend_up"] == 1) & (df["price_change"] > 0.003)
+    # Prezzo risale sopra EMA20 con momentum forte (+0.5%)
+    cover |= (df["trend_up"] == 1) & (df["price_change"] > 0.005)
 
     return cover
 
@@ -497,7 +497,7 @@ class EnsembleClassifier:
     Questo elimina la compressione del range causata dalla media semplice
     (che porta le proba da ~55-64% a ~5-43%, sotto le soglie di ingresso).
     """
-    def __init__(self, models, keep_last_n=5, min_agree=3, agree_thresh=0.50):
+    def __init__(self, models, keep_last_n=5, min_agree=2, agree_thresh=0.50):
         # Tieni solo gli ultimi N modelli non-degeneri
         self.models = models[-keep_last_n:] if len(models) > keep_last_n else models
         self.min_agree = min_agree
@@ -761,7 +761,7 @@ def walk_forward_train(df, best_params_buy=None, best_params_short=None):
     # Crea ensemble dagli ultimi N fold validi (piu' rappresentativo del backtest)
     ENSEMBLE_SIZE = 5
     if len(valid_buy_models) >= 2:
-        final_buy_model = EnsembleClassifier(valid_buy_models, keep_last_n=ENSEMBLE_SIZE)
+        final_buy_model = EnsembleClassifier(valid_buy_models, keep_last_n=ENSEMBLE_SIZE, agree_thresh=0.42)
     else:
         final_buy_model = prev_buy_model if prev_buy_model else buy_mdl
         print("  [WARN] Solo 1 modello BUY valido, no ensemble")
@@ -794,8 +794,9 @@ def walk_forward_train(df, best_params_buy=None, best_params_short=None):
     if n_buy_signals_pf > 0 and n_buy_signals_pf < len(sorted_buy):
         cal_buy_thresh = float(sorted_buy[n_buy_signals_pf - 1])
         cal_buy_thresh = max(0.30, cal_buy_thresh)
-        # Cap: la soglia non puo' superare P90 della distribuzione ensemble
-        cal_buy_thresh = min(cal_buy_thresh, max(MIN_PROBA, p90))
+        # Cap: mai oltre P75 della distribuzione ensemble, con hard ceiling +10pp sopra il default
+        hard_cap_buy = MIN_PROBA + 0.10  # max 0.68
+        cal_buy_thresh = min(cal_buy_thresh, max(MIN_PROBA, p75), hard_cap_buy)
     else:
         cal_buy_thresh = MIN_PROBA
 
@@ -816,8 +817,9 @@ def walk_forward_train(df, best_params_buy=None, best_params_short=None):
         if n_short_signals_pf > 0 and n_short_signals_pf < len(sorted_short):
             cal_short_thresh = float(sorted_short[n_short_signals_pf - 1])
             cal_short_thresh = max(0.30, cal_short_thresh)
-            # Cap: la soglia non puo' superare P90 della distribuzione ensemble
-            cal_short_thresh = min(cal_short_thresh, max(SHORT_MIN_PROBA, p90s))
+            # Cap: mai oltre P75 della distribuzione ensemble, con hard ceiling +10pp sopra il default
+            hard_cap_short = SHORT_MIN_PROBA + 0.10  # max 0.70
+            cal_short_thresh = min(cal_short_thresh, max(SHORT_MIN_PROBA, p75s), hard_cap_short)
         else:
             cal_short_thresh = SHORT_MIN_PROBA
         print(f"  [CALIBRAZIONE] SHORT ensemble proba: "
@@ -1703,17 +1705,17 @@ def run_bot(model_buy, model_short=None):
                     daily_pnl += pnl_usd
                     if "STOP_LOSS" in dash_action:
                         consecutive_sl += 1
-                        if consecutive_sl >= 2:
+                        if consecutive_sl >= 3:
                             pause_until = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
                             print(f"  [CB] {consecutive_sl} SL consecutivi -> pausa 2h")
                             send_telegram(f"⛔ <b>Circuit breaker LONG</b>: {consecutive_sl} SL di fila, pausa 2h")
                         cap = initial_capital if initial_capital else (usdt + abs(daily_pnl))
-                        if cap > 0 and daily_pnl / cap <= -0.015:
+                        if cap > 0 and daily_pnl / cap <= -0.025:
                             midnight = (datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
                                         + timedelta(days=1))
                             pause_until = midnight.isoformat()
-                            print(f"  [CB] Daily P&L {daily_pnl:.2f} <= -1.5% capitale -> pausa fino mezzanotte")
-                            send_telegram(f"⛔ <b>Circuit breaker daily</b>: P&amp;L giornaliero ${daily_pnl:.2f} (-1.5%), pausa fino mezzanotte UTC")
+                            print(f"  [CB] Daily P&L {daily_pnl:.2f} <= -2.5% capitale -> pausa fino mezzanotte")
+                            send_telegram(f"⛔ <b>Circuit breaker daily</b>: P&amp;L giornaliero ${daily_pnl:.2f} (-2.5%), pausa fino mezzanotte UTC")
                     else:  # trailing stop (trade prima era in profitto)
                         if pnl_usd > 0:
                             consecutive_sl = 0
@@ -1773,17 +1775,17 @@ def run_bot(model_buy, model_short=None):
                     daily_pnl += pnl_usd
                     if "STOP_LOSS" in dash_action:
                         consecutive_sl += 1
-                        if consecutive_sl >= 2:
+                        if consecutive_sl >= 3:
                             pause_until = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
                             print(f"  [CB] {consecutive_sl} SL consecutivi -> pausa 2h")
                             send_telegram(f"⛔ <b>Circuit breaker SHORT</b>: {consecutive_sl} SL di fila, pausa 2h")
                         cap = initial_capital if initial_capital else (usdt + abs(daily_pnl))
-                        if cap > 0 and daily_pnl / cap <= -0.015:
+                        if cap > 0 and daily_pnl / cap <= -0.025:
                             midnight = (datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
                                         + timedelta(days=1))
                             pause_until = midnight.isoformat()
-                            print(f"  [CB] Daily P&L {daily_pnl:.2f} <= -1.5% capitale -> pausa fino mezzanotte")
-                            send_telegram(f"⛔ <b>Circuit breaker daily</b>: P&amp;L giornaliero ${daily_pnl:.2f} (-1.5%), pausa fino mezzanotte UTC")
+                            print(f"  [CB] Daily P&L {daily_pnl:.2f} <= -2.5% capitale -> pausa fino mezzanotte")
+                            send_telegram(f"⛔ <b>Circuit breaker daily</b>: P&amp;L giornaliero ${daily_pnl:.2f} (-2.5%), pausa fino mezzanotte UTC")
                     else:  # trailing stop (trade prima era in profitto)
                         if pnl_usd > 0:
                             consecutive_sl = 0
@@ -1825,6 +1827,24 @@ def run_bot(model_buy, model_short=None):
                     cover_signal = False
                     dash_reason = f"COVER soppresso: hold {mins_held:.0f}m < {SHORT_MIN_HOLD * 5}m min"
                     print(f"  -> CLOSE SHORT soppresso: hold {mins_held:.0f}m < {SHORT_MIN_HOLD * 5}m")
+
+            # ============================================
+            # PROFIT GATE: sopprimi chiusura tecnica in zona di piccola perdita
+            # (consenti recupero prima dello SL; il backstop hard SL rimane sempre attivo)
+            # ============================================
+            if sell_signal and position_type == "long" and entry_price:
+                pnl_pct_now = (price - entry_price) / entry_price
+                if -0.003 < pnl_pct_now < 0:
+                    sell_signal = False
+                    dash_reason = f"CLOSE soppresso: loss piccola ({pnl_pct_now:.2%}), attesa recupero"
+                    print(f"  -> CLOSE LONG soppresso: loss piccola {pnl_pct_now:.2%}, attesa recupero")
+
+            if cover_signal and position_type == "short" and entry_price:
+                pnl_pct_now = (entry_price - price) / entry_price
+                if -0.003 < pnl_pct_now < 0:
+                    cover_signal = False
+                    dash_reason = f"COVER soppresso: loss piccola ({pnl_pct_now:.2%}), attesa recupero"
+                    print(f"  -> CLOSE SHORT soppresso: loss piccola {pnl_pct_now:.2%}, attesa recupero")
 
             # ============================================
             # APERTURA POSIZIONI (solo se flat, solo su chiusura candela 5m)
@@ -1891,10 +1911,10 @@ def run_bot(model_buy, model_short=None):
                     )
 
             elif is_5m_close and short_signal and short_enabled and usdt > 10 and not position_type and not cb_paused and not cooldown_until:
-                if trend_1h_val != 0:
+                if trend_1h_val != 0 and not (short_proba >= eff_short_thresh + 0.05 and trend_15m_val == 0):
                     dash_action = "SHORT_BLOCKED"
-                    dash_reason = f"Trend 1h UP, SHORT {short_proba:.0%} bloccato"
-                    print(f"  -> Trend 1h rialzista, SHORT bloccato.")
+                    dash_reason = f"Trend 1h UP + 15m non ribassista, SHORT {short_proba:.0%} bloccato"
+                    print(f"  -> Trend 1h rialzista + 15m non ribassista, SHORT bloccato.")
                 elif adx_1h_val < SHORT_ADX_MIN:
                     dash_action = "SHORT_BLOCKED"
                     dash_reason = f"ADX 1h {adx_1h_val:.1f} < {SHORT_ADX_MIN}, trend debole"
@@ -1943,7 +1963,7 @@ def run_bot(model_buy, model_short=None):
                 daily_pnl += pnl_usd
                 if pnl_usd > 0:
                     consecutive_sl = 0
-                cooldown_mins = 5 if pnl_usd >= 0 else 30
+                cooldown_mins = 5 if pnl_usd >= 0 else 15
                 cooldown_until = (datetime.now(timezone.utc) + timedelta(minutes=cooldown_mins)).isoformat()
                 save_state(entry_price, entry_qty, entry_time, position_type, trail_stop,
                            consecutive_sl, daily_pnl, daily_reset_date, pause_until, cooldown_until)
@@ -1972,7 +1992,7 @@ def run_bot(model_buy, model_short=None):
                 daily_pnl += pnl_usd
                 if pnl_usd > 0:
                     consecutive_sl = 0
-                cooldown_mins = 5 if pnl_usd >= 0 else 30
+                cooldown_mins = 5 if pnl_usd >= 0 else 15
                 cooldown_until = (datetime.now(timezone.utc) + timedelta(minutes=cooldown_mins)).isoformat()
                 save_state(entry_price, entry_qty, entry_time, position_type, trail_stop,
                            consecutive_sl, daily_pnl, daily_reset_date, pause_until, cooldown_until)

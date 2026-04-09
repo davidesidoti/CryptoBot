@@ -49,18 +49,19 @@ run_bot()                → live loop: LONG + SHORT on Futures Demo, every 60s 
 - **SHORT model**: SHORT (-1) vs NO-SHORT (0). `predict_proba >= SHORT_MIN_PROBA (0.60)` to open SHORT.
 
 **Signal logic:**
-- LONG close: take profit (0.6%), trailing stop (ATR×1.5 after +0.3%), stop loss (0.4%), technical rules (RSI>70, MACD cross, EMA20 break)
-- SHORT close: take profit (0.6%), trailing stop, stop loss (0.4%), technical cover rules (RSI<35, MACD bullish, EMA20 break)
-- `MIN_HOLD_BARS = 3` suppresses close for 15 min (3 bars × 5m) for LONG; `SHORT_MIN_HOLD = 3` (separate constant, line 80) for SHORT
-- Entry filters: LONG requires `trend_1h == 1` AND `trend_15m == 1`; SHORT requires `trend_1h == 0` AND `adx_1h > 15`
+- LONG close: take profit (1.2%), trailing stop (ATR×2.0 after +0.5%), stop loss (0.7%), profit gate (suppress tech close if -0.3%<loss<0%), technical rules (RSI>75, MACD 2-bar confirm, EMA20 break -0.5%)
+- SHORT close: take profit (1.2%), trailing stop, stop loss (0.7%), technical cover rules (RSI<28, MACD 2-bar confirm, EMA20 break +0.5%)
+- `MIN_HOLD_BARS = 6` suppresses close for 30 min (6 bars × 5m) for LONG; `SHORT_MIN_HOLD = 5` (separate constant, line 80) for SHORT
+- Entry filters: LONG requires `trend_1h == 1` AND `trend_15m == 1`; SHORT requires `trend_1h == 0` AND `adx_1h > 12` (or counter-trend if high confidence + 15m down)
 - Conflict: if both BUY and SHORT fire simultaneously → HOLD (do nothing)
 
 **Exit priority order:**
-1. Take profit (0.6%)
-2. Trailing stop (ATR×1.5, activated after +0.3%)
-3. Stop loss (0.4%)
-4. Technical close signals
-5. Hold minimum (15 min)
+1. Take profit (1.2%)
+2. Trailing stop (ATR×2.0, activated after +0.5%)
+3. Stop loss (0.7%)
+4. Profit gate (suppress tech close between -0.3% and 0%)
+5. Technical close signals
+6. Hold minimum (30 min LONG / 25 min SHORT)
 
 ## Key constraints
 
@@ -90,8 +91,8 @@ run_bot()                → live loop: LONG + SHORT on Futures Demo, every 60s 
   Includes signal log with action/reason for each cycle. Endpoints: `/api/status`, `/api/trades`, `/api/equity`, `/api/candles`.
 - **Degenerate folds**: use previous fold's model as fallback instead of zeroing predictions.
 - **`save_state()` / `load_state()`**: returns 10-tuple `(entry_price, qty, entry_time, position_type, trail_stop, consecutive_sl, daily_pnl, daily_reset_date, pause_until, cooldown_until)`. All new fields use `.get(key, default)` for backward compat with old state files.
-- **Circuit breaker**: 2 consecutive stop-losses → `pause_until = now + 2h`; `daily_pnl / initial_capital ≤ -1.5%` → `pause_until = midnight UTC`. Win/TP resets `consecutive_sl`. State persists across restarts via `bot_state.json`.
-- **Cooldown post-uscita**: after SELL_TECH/COVER_TECH → `cooldown_until = now + 30min` (loss) or `+5min` (win); after TP/trailing → `+5min`; after SL → no cooldown (CB handles it). Blocks new entries only, never exits. Persists via `bot_state.json`.
+- **Circuit breaker**: 3 consecutive stop-losses → `pause_until = now + 2h`; `daily_pnl / initial_capital ≤ -2.5%` → `pause_until = midnight UTC`. Win/TP resets `consecutive_sl`. State persists across restarts via `bot_state.json`.
+- **Cooldown post-uscita**: after SELL_TECH/COVER_TECH → `cooldown_until = now + 15min` (loss) or `+5min` (win); after TP/trailing → `+5min`; after SL → no cooldown (CB handles it). Blocks new entries only, never exits. Persists via `bot_state.json`.
 - **`SHORT_MIN_HOLD` is separate from `MIN_HOLD_BARS`** (line 80) — both must be updated when changing minimum hold for both directions.
 - **Retry con backoff**: transient network errors retried 3x (5s, 15s, 30s) before Telegram notification. Faster than swing version because scalping needs quick recovery.
 - **State persistence after order**: `save_state()` called immediately after `create_order()`, before Telegram/dashboard.
@@ -102,10 +103,11 @@ run_bot()                → live loop: LONG + SHORT on Futures Demo, every 60s 
 - **Take profit before trailing**: TP check runs before trailing stop in `next()` and `run_bot()`. If both trigger on same bar, TP wins.
 - **Futures-only mode**: `USE_FUTURES_FOR_BOTH=True` routes all orders through Futures. Disabling it falls back to Spot+Futures like the main branch.
 - **15m and 1h features are resampled from 5m**: no separate fetch needed. `build_features()` takes only one df parameter (5m OHLCV).
-- **EnsembleClassifier (max-with-agreement)**: instead of mean, returns max of 5 models when ≥3 agree.
-  BUY uses `agree_thresh=0.50`; SHORT uses `agree_thresh=0.40` (SHORT signals are less pronounced individually).
-  Calibration caps threshold at `min(calibrated, max(default, P90_distribution))` — prevents impossible thresholds.
-  If startup log shows "BUY=58%/SHORT=60%" (defaults), it means P90 cap kicked in — normal, not failure.
+- **EnsembleClassifier (max-with-agreement)**: instead of mean, returns max of N models when ≥2 agree.
+  BUY uses `agree_thresh=0.42`; SHORT uses `agree_thresh=0.40` (SHORT signals are less pronounced individually).
+  `min_agree=2` default (was 3) — 2/5 models agreeing is sufficient given probability threshold gates entry.
+  Calibration caps threshold at `min(calibrated, max(default, P75), default+0.10)` — P75 cap (not P90) + hard ceiling +10pp prevents impossible thresholds.
+  If startup log shows "BUY=58%/SHORT=60%" (defaults), it means cap kicked in — normal, not failure.
   Look at `[LIVE-DIAG]` to see actual proba vs threshold on each 5m candle.
 - **Calibration uses only last ENSEMBLE_SIZE folds** (not all OOS data) to avoid look-ahead bias.
   Evaluating ensemble on early-fold OOS data inflates probabilities (later-trained models see "future").
